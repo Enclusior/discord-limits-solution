@@ -16,7 +16,9 @@ export class DemoController {
   }
 
   @Post('burst')
-  async burst(@Body() body: { count?: number; channelId?: string }) {
+  async burst(
+    @Body() body: { count?: number; channelId?: string; webhookUrl?: string },
+  ) {
     const count = Math.min(Math.max(body.count ?? 10, 1), 1000);
     const channelId = body.channelId ?? 'demo-channel';
     const jobs = await Promise.all(
@@ -24,7 +26,7 @@ export class DemoController {
         this.enqueueService.enqueue({
           eventId: `demo:${channelId}:${Date.now()}:${index}`,
           channelId,
-          webhookUrl: process.env.DISCORD_WEBHOOK_A ?? '',
+          webhookUrl: body.webhookUrl ?? process.env.DISCORD_WEBHOOK_A ?? '',
           payload: {
             embeds: [
               {
@@ -45,7 +47,11 @@ export class DemoController {
     const count = Math.min(Math.max(body.count ?? 10, 1), 1000);
     const [channelA, channelB] = await Promise.all([
       this.burst({ count, channelId: 'demo-channel-a' }),
-      this.burst({ count, channelId: 'demo-channel-b' }),
+      this.burst({
+        count,
+        channelId: 'demo-channel-b',
+        webhookUrl: process.env.DISCORD_WEBHOOK_B,
+      }),
     ]);
 
     return { channelA, channelB };
