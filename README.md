@@ -162,6 +162,34 @@ curl.exe -X POST http://localhost:3000/demo/burst-both `
 curl.exe http://localhost:3000/demo/queue-status
 ```
 
+## Нагрузочное тестирование
+
+После запуска Compose нагрузочный сценарий можно выполнить из второго окна PowerShell:
+
+```powershell
+npm run test:load -- --count=500 --channel=load-test-channel
+```
+
+Сценарий создаёт 500 jobs через публичный Demo API, печатает текущие `waiting`, `active`, `delayed`, `completed`, `failed` и `dlxWaiting`, а затем завершает работу после опустошения очереди.
+
+При лимите `2/sec` один канал обработает 500 событий примерно за 4-5 минут. Это ожидаемо: нагрузочный тест проверяет соблюдение внешнего ограничения, а не отправку сверх лимита.
+
+Проверка независимости двух каналов:
+
+```powershell
+npm run test:load -- --count=500 --both=true
+```
+
+В этом режиме создаётся по 500 jobs для Channel A и Channel B. При двух webhook URL оба канала должны обрабатываться параллельно, поэтому общее время будет близко к времени одного канала, а не к последовательной обработке 1000 событий.
+
+Можно указать другой адрес приложения и частоту polling:
+
+```powershell
+npm run test:load -- --base-url=http://localhost:3000 --count=100 --poll-ms=500
+```
+
+Нагрузочный тест отправляет настоящие webhook-запросы. Для него используйте тестовый Discord-канал и заранее убедитесь, что webhook URL записан в `.env`.
+
 ## Environment
 
 | Variable                        | Description                     | Default                 |
