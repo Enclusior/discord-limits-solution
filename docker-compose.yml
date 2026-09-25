@@ -2,6 +2,9 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    command: redis-server --appendonly yes --appendfsync everysec
+    volumes:
+      - redis-data:/data
     healthcheck:
       test: ['CMD', 'redis-cli', 'ping']
       interval: 5s
@@ -23,3 +26,6 @@ services:
         condition: service_healthy
     ports:
       - '3000:3000'
+
+volumes:
+  redis-data:
