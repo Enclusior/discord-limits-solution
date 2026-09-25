@@ -1,14 +1,17 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { Job, Queue, Worker } from 'bullmq';
 import { ConfigService } from '@nestjs/config';
-import { DiscordWebhookJob } from '../../domain/discord-webhook-job';
-import { DiscordResponseClassifier } from '../discord/discord-response-classifier';
+import { DiscordWebhookJob } from '@discord-webhook/domain/discord-webhook-job';
+import { DiscordResponseClassifier } from '@discord-webhook/infrastructure/discord/discord-response-classifier';
 import { WEBHOOK_DLX_QUEUE, WEBHOOK_QUEUE } from './queue.providers';
-import { RateLimiterService } from '../redis/rate-limiter.service';
-import { WEBHOOK_TRANSPORT } from '../discord/webhook-transport';
-import type { WebhookTransport } from '../discord/webhook-transport';
+import { RateLimiterService } from '@discord-webhook/infrastructure/redis/rate-limiter.service';
+import { WEBHOOK_TRANSPORT } from '@discord-webhook/infrastructure/discord/webhook-transport';
+import type { WebhookTransport } from '@discord-webhook/infrastructure/discord/webhook-transport';
 import Redis from 'ioredis';
-import { REDIS_CLIENT, DISCORD_WEBHOOK_QUEUE } from '../redis/redis.constants';
+import {
+  REDIS_CLIENT,
+  DISCORD_WEBHOOK_QUEUE,
+} from '@discord-webhook/infrastructure/redis/redis.constants';
 
 @Injectable()
 export class WebhookProcessor {

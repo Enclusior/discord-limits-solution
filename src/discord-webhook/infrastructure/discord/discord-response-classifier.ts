@@ -1,5 +1,5 @@
 import { Injectable } from '@nestjs/common';
-import { DeliveryResult } from '../../domain/delivery-result';
+import { DeliveryResult } from '@discord-webhook/domain/delivery-result';
 
 export interface DiscordHttpResponse {
   statusCode: number;

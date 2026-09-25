@@ -1,5 +1,5 @@
 import { Controller, Get, ServiceUnavailableException } from '@nestjs/common';
-import { QueueStatsService } from '../discord-webhook/application/queue-stats.service';
+import { QueueStatsService } from '@discord-webhook/application/queue-stats.service';
 
 @Controller('health')
 export class HealthController {

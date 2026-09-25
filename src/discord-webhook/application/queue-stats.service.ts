@@ -3,7 +3,7 @@ import { Queue } from 'bullmq';
 import {
   WEBHOOK_DLX_QUEUE,
   WEBHOOK_QUEUE,
-} from '../infrastructure/queue/queue.providers';
+} from '@discord-webhook/infrastructure/queue/queue.providers';
 
 export interface QueueStats {
   waiting: number;

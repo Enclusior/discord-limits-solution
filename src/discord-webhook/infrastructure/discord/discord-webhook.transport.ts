@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import axios, { AxiosError } from 'axios';
-import { DiscordWebhookPayload } from '../../domain/discord-webhook-payload';
+import { DiscordWebhookPayload } from '@discord-webhook/domain/discord-webhook-payload';
 import { DiscordHttpResponse } from './discord-response-classifier';
 import { WebhookTransport } from './webhook-transport';
 

@@ -1,7 +1,7 @@
 import { Body, Controller, Get, Post } from '@nestjs/common';
-import { EnqueueWebhookService } from '../discord-webhook/application/enqueue-webhook.service';
-import { QueueStatsService } from '../discord-webhook/application/queue-stats.service';
-import type { EnqueueWebhookInput } from '../discord-webhook/domain/discord-webhook-job';
+import { EnqueueWebhookService } from '@discord-webhook/application/enqueue-webhook.service';
+import { QueueStatsService } from '@discord-webhook/application/queue-stats.service';
+import type { EnqueueWebhookInput } from '@discord-webhook/domain/discord-webhook-job';
 
 @Controller('demo')
 export class DemoController {

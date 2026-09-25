@@ -11,7 +11,16 @@
     "experimentalDecorators": true,
     "allowSyntheticDefaultImports": true,
     "target": "ES2023",
+    "ignoreDeprecations": "6.0",
     "rootDir": ".",
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["src/*"],
+      "@config/*": ["src/config/*"],
+      "@demo/*": ["src/demo/*"],
+      "@discord-webhook/*": ["src/discord-webhook/*"],
+      "@health/*": ["src/health/*"]
+    },
     "types": ["node", "jest"],
     "sourceMap": true,
     "outDir": "./dist",

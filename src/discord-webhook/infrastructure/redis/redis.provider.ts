@@ -1,7 +1,7 @@
 import { Provider } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import Redis from 'ioredis';
-import { REDIS_CLIENT } from './redis.constants';
+import { REDIS_CLIENT } from '@discord-webhook/infrastructure/redis/redis.constants';
 
 export const redisProvider: Provider = {
   provide: REDIS_CLIENT,

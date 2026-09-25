@@ -5,5 +5,12 @@
   "testRegex": ".e2e-spec.ts$",
   "transform": {
     "^.+\\.(t|j)s$": "ts-jest"
+  },
+  "moduleNameMapper": {
+    "^@/(.*)$": "<rootDir>/../src/$1",
+    "^@config/(.*)$": "<rootDir>/../src/config/$1",
+    "^@demo/(.*)$": "<rootDir>/../src/demo/$1",
+    "^@discord-webhook/(.*)$": "<rootDir>/../src/discord-webhook/$1",
+    "^@health/(.*)$": "<rootDir>/../src/health/$1"
   }
 }

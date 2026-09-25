@@ -5,7 +5,7 @@ import Redis from 'ioredis';
 import {
   DISCORD_WEBHOOK_DLX_QUEUE,
   DISCORD_WEBHOOK_QUEUE,
-} from '../redis/redis.constants';
+} from '@discord-webhook/infrastructure/redis/redis.constants';
 
 export const WEBHOOK_QUEUE = Symbol('WEBHOOK_QUEUE');
 export const WEBHOOK_DLX_QUEUE = Symbol('WEBHOOK_DLX_QUEUE');

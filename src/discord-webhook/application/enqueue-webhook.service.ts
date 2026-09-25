@@ -3,8 +3,8 @@ import { Queue } from 'bullmq';
 import {
   DiscordWebhookJob,
   EnqueueWebhookInput,
-} from '../domain/discord-webhook-job';
-import { WEBHOOK_QUEUE } from '../infrastructure/queue/queue.providers';
+} from '@discord-webhook/domain/discord-webhook-job';
+import { WEBHOOK_QUEUE } from '@discord-webhook/infrastructure/queue/queue.providers';
 
 @Injectable()
 export class EnqueueWebhookService {
