@@ -8,6 +8,11 @@ import { queueProviders } from './infrastructure/queue/queue.providers';
 import { WebhookProcessor } from './infrastructure/queue/webhook.processor';
 import { RateLimiterService } from './infrastructure/redis/rate-limiter.service';
 import { redisProvider } from './infrastructure/redis/redis.provider';
+import {
+  WEBHOOK_DLX_QUEUE,
+  WEBHOOK_QUEUE,
+} from './infrastructure/queue/queue.providers';
+import { REDIS_CLIENT } from './infrastructure/redis/redis.constants';
 
 @Module({
   imports: [ConfigModule],
@@ -24,6 +29,11 @@ import { redisProvider } from './infrastructure/redis/redis.provider';
     WebhookProcessor,
     EnqueueWebhookService,
   ],
-  exports: [EnqueueWebhookService],
+  exports: [
+    EnqueueWebhookService,
+    WEBHOOK_QUEUE,
+    WEBHOOK_DLX_QUEUE,
+    REDIS_CLIENT,
+  ],
 })
 export class DiscordWebhookModule {}

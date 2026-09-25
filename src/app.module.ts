@@ -5,6 +5,8 @@ import { AppService } from './app.service';
 import configuration from './config/configuration';
 import { environmentValidationSchema } from './config/env.validation';
 import { DiscordWebhookModule } from './discord-webhook/discord-webhook.module';
+import { DemoModule } from './demo/demo.module';
+import { HealthModule } from './health/health.module';
 
 @Module({
   imports: [
@@ -14,6 +16,8 @@ import { DiscordWebhookModule } from './discord-webhook/discord-webhook.module';
       validationSchema: environmentValidationSchema,
     }),
     DiscordWebhookModule,
+    DemoModule,
+    HealthModule,
   ],
   controllers: [AppController],
   providers: [AppService],
