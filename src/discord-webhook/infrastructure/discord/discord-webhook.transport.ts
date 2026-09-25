@@ -11,7 +11,11 @@ export class DiscordWebhookTransport implements WebhookTransport {
     payload: DiscordWebhookPayload,
   ): Promise<DiscordHttpResponse> {
     try {
-      const response = await axios.post(webhookUrl, payload, {
+      const url = new URL(webhookUrl);
+      if (process.env.DISCORD_WAIT_FOR_MESSAGE !== 'false') {
+        url.searchParams.set('wait', 'true');
+      }
+      const response = await axios.post(url.toString(), payload, {
         timeout: Number(process.env.DISCORD_REQUEST_TIMEOUT_MS ?? 10000),
         validateStatus: () => true,
       });

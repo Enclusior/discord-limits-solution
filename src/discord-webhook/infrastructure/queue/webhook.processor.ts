@@ -79,6 +79,12 @@ export class WebhookProcessor {
           channelId: data.channelId,
           jobId: job.id,
           statusCode: result.statusCode,
+          discordMessageId:
+            typeof response.body === 'object' &&
+            response.body !== null &&
+            'id' in response.body
+              ? response.body.id
+              : undefined,
           duration: Date.now() - startedAt,
         });
         return;
