@@ -44,10 +44,21 @@ export class WebhookProcessor {
 
   private async process(job: Job<DiscordWebhookJob>): Promise<void> {
     const { data } = job;
-    const reservation = await this.limiter.reserve(data.channelId);
+    const reservation = data.reservedAt
+      ? {
+          delayMs: Math.max(0, data.reservedAt - Date.now()),
+          reservedAt: data.reservedAt,
+        }
+      : await this.limiter.reserve(data.channelId);
 
     if (reservation.delayMs > 0) {
-      await this.reschedule(job, reservation.delayMs, 'channel rate limit');
+      await this.reschedule(
+        job,
+        reservation.delayMs,
+        'channel rate limit',
+        false,
+        reservation.reservedAt,
+      );
       return;
     }
 
@@ -98,15 +109,17 @@ export class WebhookProcessor {
     delayMs: number,
     reason: string,
     countsAsDeliveryAttempt = false,
+    reservedAt?: number,
   ): Promise<void> {
     const deliveryAttempts =
       (job.data.deliveryAttempts ?? 0) + Number(countsAsDeliveryAttempt);
     const scheduledData: DiscordWebhookJob = {
       ...job.data,
       deliveryAttempts,
+      reservedAt,
     };
     await this.queue.add(job.name, scheduledData, {
-      jobId: `${job.id}:scheduled:${Date.now()}`,
+      jobId: `${job.id ?? 'webhook'}-scheduled-${Date.now()}`,
       delay: Math.max(1, delayMs),
       removeOnComplete: 1000,
       removeOnFail: false,
