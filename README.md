@@ -1,114 +1,216 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+# Discord Webhook Delivery Module
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+Переиспользуемый NestJS-модуль для надёжной асинхронной доставки Discord Webhook-сообщений. Проект рассчитан на сценарий, в котором события нельзя терять при всплесках нагрузки, каналы должны обрабатываться независимо, а внешний rate limit Discord необходимо соблюдать при нескольких worker-инстансах.
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
+## Возможности
 
-## Description
+- одна durable BullMQ queue `discord-webhooks`;
+- отдельная DLX queue `discord-webhooks-dlx`;
+- Redis как backend очереди и источник распределённого rate-limit state;
+- атомарная Lua reservation для каждого channel/bucket key;
+- safety limit по умолчанию `2 webhook/sec` на канал;
+- delayed rescheduling вместо долгого `sleep` внутри worker;
+- `429` с приоритетом Discord `retry_after`/`Retry-After`;
+- ограниченный exponential backoff с jitter для `5xx` и network failures;
+- permanent failures (`400`, `401`, `403`, `404`) в DLX без бесконечного retry;
+- eventId как BullMQ job id для deduplication;
+- structured event logging без полного webhook URL;
+- demo endpoints, health endpoint и queue status;
+- Docker Compose с Redis и приложением.
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
+## Архитектура
 
-## Project setup
+```text
+Application / Demo API
+          |
+          v
+DiscordWebhookModule
+          |
+          v
+BullMQ: discord-webhooks  --->  Redis
+          |                        |
+          |                        +-- atomic Lua reservation
+          v
+WebhookProcessor
+    |             |
+    v             v
+Channel A      Channel B
+Limiter        Limiter
+    |             |
+    v             v
+Discord A      Discord B
 
-```bash
-$ npm install
+Permanent failures ---> discord-webhooks-dlx
 ```
 
-## Compile and run the project
+Очередь отвечает за durable jobs, delayed scheduling и восстановление после worker restart. Redis координирует per-channel reservations между несколькими процессами. Transport отвечает только за HTTP и интерпретацию ответа Discord.
 
-```bash
-# development
-$ npm run start
+### Почему не global BullMQ limiter
 
-# watch mode
-$ npm run start:dev
+Обычный BullMQ limiter ограничивал бы всю queue. Нам нужно `A -> 2/sec` и одновременно `B -> 2/sec`, поэтому rate limit вынесен в Redis-based механизм с ключом канала. Queue остаётся одной: channel isolation является свойством job scheduling, а не количеством очередей.
 
-# production mode
-$ npm run start:prod
+### Почему Lua
+
+Проверка `nextAllowedAt` и reservation следующего слота выполняются одной Redis-операцией. Несколько worker'ов не смогут одновременно получить один и тот же слот.
+
+### Почему не sleep
+
+Если канал заблокирован на несколько секунд, job переводится в delayed state и освобождает worker. Это сохраняет concurrency для других каналов.
+
+## Delivery semantics
+
+Сервис предоставляет **at-least-once delivery**.
+
+Очередь сохраняет pending jobs, а незавершённые jobs могут быть обработаны после restart. Однако HTTP request имеет неоднозначный случай: Discord мог принять сообщение, а соединение могло оборваться до получения ответа. Поэтому повторная попытка теоретически создаёт duplicate message. Exactly-once через обычный Discord Webhook гарантировать нельзя.
+
+`eventId` используется как job id BullMQ и помогает предотвращать неконтролируемый duplicate enqueue. Это не превращает внешний HTTP API в exactly-once transport.
+
+Reservation может быть потеряна, если worker упал после Redis reservation, но до HTTP request. Это сознательный trade-off: потеря небольшого временного слота безопаснее, чем нарушение общего rate limit.
+
+## HTTP failure policy
+
+| Сценарий               | Поведение                                                         |
+| ---------------------- | ----------------------------------------------------------------- |
+| `2xx`                  | Job завершена успешно                                             |
+| `400`                  | Permanent failure, логирование и DLX                              |
+| `401/403/404`          | Permanent/configuration failure и DLX                             |
+| `429`                  | Delayed reschedule по body `retry_after` или header `Retry-After` |
+| `5xx`                  | Ограниченный retry с exponential backoff и jitter                 |
+| timeout/network error  | Ограниченный retry с exponential backoff и jitter                 |
+| retry limit исчерпан   | DLX с исходным envelope и причиной                                |
+| Channel A rate limited | Channel B продолжает работу                                       |
+
+При наличии Discord bucket header transport/classifier сохраняет его в delivery result; текущий safety key по умолчанию строится по channel. Business-level isolation и реальные Discord buckets не являются полностью одинаковыми понятиями: Discord может группировать endpoints по своим bucket rules.
+
+## Публичный API
+
+```typescript
+await discordWebhookService.enqueue({
+  eventId: 'user:123:registered',
+  channelId: 'new-users',
+  webhookUrl: process.env.DISCORD_WEBHOOK_A!,
+  payload: {
+    embeds: [
+      {
+        title: 'New user',
+        description: 'User registered',
+      },
+    ],
+  },
+});
 ```
 
-## Run tests
+Вызывающий код не занимается retry, rate limit, Discord HTTP errors или DLX.
 
-```bash
-# unit tests
-$ npm run test
+## Local setup
 
-# e2e tests
-$ npm run test:e2e
+Требования: Node.js 22+, npm и Docker Desktop с запущенным Docker Engine.
 
-# test coverage
-$ npm run test:cov
+```powershell
+Copy-Item .env.example .env
 ```
 
-## Deployment
+Заполните `DISCORD_WEBHOOK_A` и при необходимости `DISCORD_WEBHOOK_B`, затем:
 
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
-
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
-
-```bash
-$ npm install -g @nestjs/mau
-$ mau deploy
+```powershell
+docker compose up --build
 ```
 
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
+Остановка:
 
-## Observability
+```powershell
+docker compose down
+```
 
-In production applications, observability is essential for understanding how your system behaves, detecting issues early, and maintaining reliable performance.
+Redis устанавливать отдельно не нужно.
 
-[NestJS Observe](https://observe.nestjs.com) automatically instruments your NestJS application, giving you deep visibility into your system with minimal setup:
+## Demo API
 
-- **Distributed tracing:** Follow requests across services and understand how they flow through your system.
-- **Waterfall analysis:** Visualize request execution and identify slow operations, bottlenecks, and unexpected delays.
-- **Performance analysis:** Analyze application performance in real time and quickly pinpoint areas that need optimization.
-- **Metrics:** Track key application and infrastructure metrics to understand system health and performance trends.
-- **Logging:** Centralize and correlate logs with traces and other telemetry to make debugging easier.
-- **Error tracking:** Detect errors quickly and investigate their root causes with the surrounding context.
-- **SLA monitoring:** Track service-level objectives and identify when your application is approaching or exceeding defined thresholds.
-- **Alarms and alerts:** Set up alerts for critical errors, performance degradation, SLA violations, and other anomalies so your team can react quickly.
+Проверка health:
 
-## Resources
+```powershell
+curl.exe http://localhost:3000/health
+```
 
-Check out a few resources that may come in handy when working with NestJS:
+Одно событие:
 
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Auto-instrument your application with [NestJS Observer](https://observer.nestjs.com). Distributed tracing, metrics, and logging made easy. Error tracking and performance monitoring for your NestJS applications.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
+```powershell
+curl.exe -X POST http://localhost:3000/demo/webhook `
+  -H "Content-Type: application/json" `
+  -d '{"eventId":"user:123:registered","channelId":"new-users","webhookUrl":"https://discord.com/api/webhooks/placeholder/placeholder","payload":{"embeds":[{"title":"New user","description":"User registered"}]}}'
+```
 
-## Support
+Burst одного канала:
 
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
+```powershell
+curl.exe -X POST http://localhost:3000/demo/burst `
+  -H "Content-Type: application/json" `
+  -d '{"channelId":"channel-a","count":20}'
+```
 
-## Stay in touch
+Burst двух независимых каналов:
 
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
+```powershell
+curl.exe -X POST http://localhost:3000/demo/burst-both `
+  -H "Content-Type: application/json" `
+  -d '{"count":20}'
+```
 
-## License
+Статус очередей:
 
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+```powershell
+curl.exe http://localhost:3000/demo/queue-status
+```
+
+## Environment
+
+| Variable                        | Description                     | Default                 |
+| ------------------------------- | ------------------------------- | ----------------------- |
+| `PORT`                          | HTTP port                       | `3000`                  |
+| `REDIS_HOST`                    | Redis host                      | `localhost`             |
+| `REDIS_PORT`                    | Redis port                      | `6379`                  |
+| `DISCORD_RATE_LIMIT_PER_SECOND` | Safety limit per channel        | `2`                     |
+| `DISCORD_WORKER_CONCURRENCY`    | Overall worker concurrency      | `10`                    |
+| `DISCORD_REQUEST_TIMEOUT_MS`    | Discord HTTP timeout            | `10000`                 |
+| `DISCORD_RETRY_MAX_ATTEMPTS`    | Max retryable delivery attempts | `5`                     |
+| `DISCORD_RETRY_BASE_DELAY_MS`   | Initial backoff                 | `1000`                  |
+| `DISCORD_RETRY_MAX_DELAY_MS`    | Backoff ceiling                 | `30000`                 |
+| `DISCORD_WEBHOOK_A`             | Demo webhook A                  | required for burst demo |
+| `DISCORD_WEBHOOK_B`             | Demo webhook B                  | optional                |
+
+`.env` не коммитится. Полный пример находится в `.env.example`.
+
+## Development checks
+
+```bash
+npm ci
+npm run lint
+npm run format:check
+npm run build
+npm test
+npm run test:e2e
+```
+
+Focused webhook tests:
+
+```bash
+npx jest src/discord-webhook --runInBand
+```
+
+Docker Compose configuration:
+
+```bash
+docker compose config
+```
+
+## Trade-offs
+
+- Redis + BullMQ выбраны вместо RabbitMQ/Kafka, потому что здесь нужны durable jobs и delayed retry без event-streaming платформы.
+- Custom Redis limiter выбран вместо BullMQ Pro group rate limiting: он решает per-channel задачу без платной зависимости.
+- Одна queue проще queue-per-channel и не требует динамического управления инфраструктурой.
+- At-least-once честнее exactly-once для HTTP webhook без поддержки idempotency на стороне Discord.
+- `2/sec` остаётся safety ceiling из тестового задания даже если Discord сообщает другие bucket metadata.
+
+## Production considerations
+
+В полноценной интеграции можно добавить transactional outbox, secret manager/encryption, OpenTelemetry, Prometheus, tracing, alerting, webhook health management и managed Redis. Outbox особенно важен для сценария `DB commit succeeded, queue.add failed`: бизнес-транзакция должна записать событие в outbox, а отдельный publisher отправит его в очередь. PostgreSQL в этот demo намеренно не добавляется.

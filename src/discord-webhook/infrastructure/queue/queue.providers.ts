@@ -5,7 +5,6 @@ import Redis from 'ioredis';
 import {
   DISCORD_WEBHOOK_DLX_QUEUE,
   DISCORD_WEBHOOK_QUEUE,
-  REDIS_CLIENT,
 } from '../redis/redis.constants';
 
 export const WEBHOOK_QUEUE = Symbol('WEBHOOK_QUEUE');
@@ -37,5 +36,3 @@ export const queueProviders: Provider[] = [
       }),
   },
 ];
-
-export const queueTokens = [WEBHOOK_QUEUE, WEBHOOK_DLX_QUEUE, REDIS_CLIENT];

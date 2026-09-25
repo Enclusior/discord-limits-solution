@@ -6,6 +6,7 @@ export interface DiscordWebhookJob {
   webhookUrl: string;
   payload: DiscordWebhookPayload;
   createdAt: string;
+  deliveryAttempts?: number;
   metadata?: Record<string, string>;
 }
 

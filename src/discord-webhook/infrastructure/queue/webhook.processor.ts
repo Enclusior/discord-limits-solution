@@ -67,7 +67,12 @@ export class WebhookProcessor {
       }
 
       if (result.type === 'rate_limited') {
-        await this.reschedule(job, result.retryAfterMs, 'Discord Retry-After');
+        await this.reschedule(
+          job,
+          result.retryAfterMs,
+          'Discord Retry-After',
+          true,
+        );
         return;
       }
 
@@ -89,11 +94,17 @@ export class WebhookProcessor {
     job: Job<DiscordWebhookJob>,
     delayMs: number,
     reason: string,
+    countsAsDeliveryAttempt = false,
   ): Promise<void> {
-    await this.queue.add(job.name, job.data, {
+    const deliveryAttempts =
+      (job.data.deliveryAttempts ?? 0) + Number(countsAsDeliveryAttempt);
+    const scheduledData: DiscordWebhookJob = {
+      ...job.data,
+      deliveryAttempts,
+    };
+    await this.queue.add(job.name, scheduledData, {
       jobId: `${job.id}:scheduled:${Date.now()}`,
       delay: Math.max(1, delayMs),
-      attempts: job.opts.attempts,
       removeOnComplete: 1000,
       removeOnFail: false,
     });
@@ -111,7 +122,7 @@ export class WebhookProcessor {
     job: Job<DiscordWebhookJob>,
     reason: string,
   ): Promise<void> {
-    const attempts = job.attemptsMade + 1;
+    const attempts = (job.data.deliveryAttempts ?? 0) + 1;
     const maxAttempts = this.config.getOrThrow<number>(
       'discord.retryMaxAttempts',
     );
@@ -132,7 +143,7 @@ export class WebhookProcessor {
     const jitter = Math.floor(
       Math.random() * Math.max(1, exponentialDelay / 4),
     );
-    await this.reschedule(job, exponentialDelay + jitter, reason);
+    await this.reschedule(job, exponentialDelay + jitter, reason, true);
   }
 
   private async deadLetter(
@@ -144,7 +155,7 @@ export class WebhookProcessor {
       ...job.data,
       reason,
       statusCode,
-      attempts: job.attemptsMade + 1,
+      attempts: (job.data.deliveryAttempts ?? 0) + 1,
       firstAttemptAt: job.data.createdAt,
       lastAttemptAt: new Date().toISOString(),
     });

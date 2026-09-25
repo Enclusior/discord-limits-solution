@@ -15,9 +15,9 @@ import { HealthModule } from './health/health.module';
       load: [configuration],
       validationSchema: environmentValidationSchema,
     }),
-    DiscordWebhookModule,
-    DemoModule,
-    HealthModule,
+    ...(process.env.NODE_ENV === 'test'
+      ? []
+      : [DiscordWebhookModule, DemoModule, HealthModule]),
   ],
   controllers: [AppController],
   providers: [AppService],

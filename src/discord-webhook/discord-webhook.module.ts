@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { Inject, Module, OnModuleDestroy } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { EnqueueWebhookService } from './application/enqueue-webhook.service';
 import { DiscordResponseClassifier } from './infrastructure/discord/discord-response-classifier';
@@ -13,6 +13,8 @@ import {
   WEBHOOK_QUEUE,
 } from './infrastructure/queue/queue.providers';
 import { REDIS_CLIENT } from './infrastructure/redis/redis.constants';
+import type Redis from 'ioredis';
+import type { Queue } from 'bullmq';
 
 @Module({
   imports: [ConfigModule],
@@ -36,4 +38,15 @@ import { REDIS_CLIENT } from './infrastructure/redis/redis.constants';
     REDIS_CLIENT,
   ],
 })
-export class DiscordWebhookModule {}
+export class DiscordWebhookModule implements OnModuleDestroy {
+  constructor(
+    @Inject(WEBHOOK_QUEUE) private readonly queue: Queue,
+    @Inject(WEBHOOK_DLX_QUEUE) private readonly dlxQueue: Queue,
+    @Inject(REDIS_CLIENT) private readonly redis: Redis,
+  ) {}
+
+  async onModuleDestroy(): Promise<void> {
+    await Promise.all([this.queue.close(), this.dlxQueue.close()]);
+    await this.redis.quit();
+  }
+}

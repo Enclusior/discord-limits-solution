@@ -5,7 +5,7 @@ export const environmentValidationSchema = Joi.object({
     .valid('development', 'test', 'production')
     .default('development'),
   PORT: Joi.number().port().default(3000),
-  REDIS_HOST: Joi.string().required(),
+  REDIS_HOST: Joi.string().default('localhost'),
   REDIS_PORT: Joi.number().port().default(6379),
   REDIS_PASSWORD: Joi.string().allow('').optional(),
   DISCORD_RATE_LIMIT_PER_SECOND: Joi.number().integer().min(1).default(2),
