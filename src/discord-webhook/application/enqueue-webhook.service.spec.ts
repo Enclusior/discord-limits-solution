@@ -1,11 +1,12 @@
-import { Queue } from 'bullmq';
 import { EnqueueWebhookService } from './enqueue-webhook.service';
-import { WEBHOOK_QUEUE } from '../infrastructure/queue/queue.providers';
+import { OutboxRepository } from '@outbox/application/outbox.repository';
 
 describe('EnqueueWebhookService', () => {
-  it('uses eventId as BullMQ job id for deduplication', async () => {
-    const add = jest.fn().mockResolvedValue({ id: 'event-1' });
-    const service = new EnqueueWebhookService({ add } as unknown as Queue);
+  it('writes the event to the durable outbox', async () => {
+    const insertPendingEvent = jest.fn().mockResolvedValue(undefined);
+    const service = new EnqueueWebhookService({
+      insertPendingEvent,
+    } as unknown as OutboxRepository);
 
     await service.enqueue({
       eventId: 'event-1',
@@ -14,11 +15,8 @@ describe('EnqueueWebhookService', () => {
       payload: { content: 'hello' },
     });
 
-    expect(add).toHaveBeenCalledWith(
-      'deliver-webhook',
+    expect(insertPendingEvent).toHaveBeenCalledWith(
       expect.objectContaining({ eventId: 'event-1' }),
-      expect.objectContaining({ jobId: 'event-1' }),
     );
-    expect(WEBHOOK_QUEUE).toBeDefined();
   });
 });

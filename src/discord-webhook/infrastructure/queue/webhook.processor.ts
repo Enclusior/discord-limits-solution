@@ -69,6 +69,10 @@ export class WebhookProcessor {
       const result = this.classifier.classify(response);
 
       if (result.type === 'success') {
+        await job.updateData({
+          ...data,
+          deliveredAt: new Date().toISOString(),
+        });
         this.logger.log({
           event: 'discord.webhook.sent',
           eventId: data.eventId,

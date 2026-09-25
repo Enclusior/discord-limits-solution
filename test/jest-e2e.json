@@ -11,6 +11,7 @@
     "^@config/(.*)$": "<rootDir>/../src/config/$1",
     "^@demo/(.*)$": "<rootDir>/../src/demo/$1",
     "^@discord-webhook/(.*)$": "<rootDir>/../src/discord-webhook/$1",
-    "^@health/(.*)$": "<rootDir>/../src/health/$1"
+    "^@health/(.*)$": "<rootDir>/../src/health/$1",
+    "^@outbox/(.*)$": "<rootDir>/../src/outbox/$1"
   }
 }

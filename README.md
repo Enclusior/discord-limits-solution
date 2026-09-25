@@ -67,6 +67,23 @@ Permanent failures ---> discord-webhooks-dlx
 
 Reservation может быть потеряна, если worker упал после Redis reservation, но до HTTP request. Это сознательный trade-off: потеря небольшого временного слота безопаснее, чем нарушение общего rate limit.
 
+## Transactional outbox
+
+Для интеграции с бизнес-приложением добавлен PostgreSQL-backed transactional outbox. `enqueue()` сначала сохраняет полный webhook envelope в таблицу `webhook_outbox_events` с уникальным `event_id`. Отдельный publisher забирает pending rows через `FOR UPDATE SKIP LOCKED`, ставит lease, публикует job в BullMQ и только после этого переводит запись в `published`.
+
+Это закрывает опасное окно:
+
+```text
+business transaction + outbox INSERT -> COMMIT
+              |
+              v
+            outbox publisher -> BullMQ -> Discord
+```
+
+Если приложение упадёт после `COMMIT`, событие останется в PostgreSQL. Если publisher упадёт после добавления BullMQ job, повторная попытка использует тот же deterministic job id; duplicate job считается уже опубликованной и outbox корректно помечается `published`. Если publisher упадёт до публикации, lease истечёт, и запись будет обработана повторно.
+
+Outbox гарантирует durable handoff до очереди и at-least-once semantics. Он не может гарантировать exactly-once на внешнем Discord HTTP API: сетевой разрыв после принятия запроса всё ещё может привести к повторному сообщению.
+
 ## HTTP failure policy
 
 | Сценарий               | Поведение                                                         |
@@ -116,6 +133,8 @@ Copy-Item .env.example .env
 docker compose up --build
 ```
 
+Compose поднимает `app`, `redis` и `postgres`. PostgreSQL автоматически создаёт таблицу outbox из `src/outbox/infrastructure/outbox.schema.sql`. Данные Redis и PostgreSQL сохраняются в named volumes.
+
 Остановка:
 
 ```powershell
@@ -123,6 +142,25 @@ docker compose down
 ```
 
 Redis устанавливать отдельно не нужно.
+
+### Восстановление после сбоя
+
+Redis работает с AOF persistence и named volume `redis-data`. Поэтому при обычном:
+
+```powershell
+docker compose down
+docker compose up -d
+```
+
+незавершённые BullMQ jobs остаются в Redis и после запуска worker продолжают обработку. Неиспользованный слот rate limiter может быть потерян после падения worker, но сама job не должна исчезнуть.
+
+Команда ниже намеренно удаляет Redis volume вместе со всеми очередями и используется только для полного сброса локального теста:
+
+```powershell
+docker compose down -v
+```
+
+Семантика доставки остаётся at-least-once: если Discord принял запрос, а worker упал до получения ответа, после восстановления возможна повторная отправка.
 
 ## Demo API
 
@@ -187,6 +225,14 @@ npm run test:load -- --count=500 --both=true
 ```powershell
 npm run test:load -- --base-url=http://localhost:3000 --count=100 --poll-ms=500
 ```
+
+Для DLX используйте отдельный тестовый webhook с намеренно неверным URL. Discord должен вернуть permanent `4xx` (обычно `404`), после чего события попадут в `discord-webhooks-dlx`:
+
+```powershell
+npm run test:load -- --count=10 --channel=dlx-test --webhook-url=https://discord.com/api/webhooks/invalid/invalid
+```
+
+Ожидаемый результат DLX-сценария: `completed: 0`, `failed: 0`, `dlxWaiting: 10`. Внутри системы это не worker failure: permanent ошибка обрабатывается явно и переносится в DLX.
 
 Нагрузочный тест отправляет настоящие webhook-запросы. Для него используйте тестовый Discord-канал и заранее убедитесь, что webhook URL записан в `.env`.
 

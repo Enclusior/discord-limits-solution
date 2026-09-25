@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Post } from '@nestjs/common';
+import { Body, Controller, Get, Post, Query } from '@nestjs/common';
 import { EnqueueWebhookService } from '@discord-webhook/application/enqueue-webhook.service';
 import { QueueStatsService } from '@discord-webhook/application/queue-stats.service';
 import type { EnqueueWebhookInput } from '@discord-webhook/domain/discord-webhook-job';
@@ -17,7 +17,13 @@ export class DemoController {
 
   @Post('burst')
   async burst(
-    @Body() body: { count?: number; channelId?: string; webhookUrl?: string },
+    @Body()
+    body: {
+      count?: number;
+      channelId?: string;
+      webhookUrl?: string;
+      runId?: string;
+    },
   ) {
     const count = Math.min(Math.max(body.count ?? 10, 1), 1000);
     const channelId = body.channelId ?? 'demo-channel';
@@ -35,6 +41,7 @@ export class DemoController {
               },
             ],
           },
+          metadata: body.runId ? { runId: body.runId } : undefined,
         }),
       ),
     );
@@ -43,14 +50,19 @@ export class DemoController {
   }
 
   @Post('burst-both')
-  async burstBoth(@Body() body: { count?: number }) {
+  async burstBoth(@Body() body: { count?: number; runId?: string }) {
     const count = Math.min(Math.max(body.count ?? 10, 1), 1000);
     const [channelA, channelB] = await Promise.all([
-      this.burst({ count, channelId: 'demo-channel-a' }),
+      this.burst({
+        count,
+        channelId: 'demo-channel-a',
+        runId: body.runId,
+      }),
       this.burst({
         count,
         channelId: 'demo-channel-b',
         webhookUrl: process.env.DISCORD_WEBHOOK_B,
+        runId: body.runId,
       }),
     ]);
 
@@ -58,7 +70,27 @@ export class DemoController {
   }
 
   @Get('queue-status')
-  queueStatus() {
-    return this.statsService.getStats();
+  queueStatus(@Query('runId') runId?: string) {
+    return runId
+      ? this.statsService.getRunStats(runId)
+      : this.statsService.getStats();
+  }
+
+  @Post('load-summary')
+  loadSummary(@Body() body: { runId: string; summary: string }) {
+    return this.enqueueService.enqueue({
+      eventId: `load-summary-${body.runId}`,
+      channelId: `load-summary-${body.runId}`,
+      webhookUrl: process.env.DISCORD_WEBHOOK_A ?? '',
+      payload: {
+        embeds: [
+          {
+            title: 'Webhook load test completed',
+            description: body.summary,
+          },
+        ],
+      },
+      metadata: { summary: 'true' },
+    });
   }
 }

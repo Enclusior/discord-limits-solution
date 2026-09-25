@@ -15,11 +15,15 @@ import {
 import { REDIS_CLIENT } from './infrastructure/redis/redis.constants';
 import type Redis from 'ioredis';
 import type { Queue } from 'bullmq';
+import { OutboxPublisher } from '@outbox/application/outbox.publisher';
+import { OutboxRepository } from '@outbox/application/outbox.repository';
+import { postgresProvider } from '@outbox/infrastructure/postgres.provider';
 
 @Module({
   imports: [ConfigModule],
   providers: [
     redisProvider,
+    postgresProvider,
     ...queueProviders,
     DiscordResponseClassifier,
     DiscordWebhookTransport,
@@ -30,12 +34,15 @@ import type { Queue } from 'bullmq';
     RateLimiterService,
     WebhookProcessor,
     EnqueueWebhookService,
+    OutboxRepository,
+    OutboxPublisher,
   ],
   exports: [
     EnqueueWebhookService,
     WEBHOOK_QUEUE,
     WEBHOOK_DLX_QUEUE,
     REDIS_CLIENT,
+    OutboxRepository,
   ],
 })
 export class DiscordWebhookModule implements OnModuleDestroy {

@@ -19,7 +19,8 @@
       "@config/*": ["src/config/*"],
       "@demo/*": ["src/demo/*"],
       "@discord-webhook/*": ["src/discord-webhook/*"],
-      "@health/*": ["src/health/*"]
+      "@health/*": ["src/health/*"],
+      "@outbox/*": ["src/outbox/*"]
     },
     "types": ["node", "jest"],
     "sourceMap": true,
