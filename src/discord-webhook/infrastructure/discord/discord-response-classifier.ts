@@ -7,61 +7,54 @@ export interface DiscordHttpResponse {
   body?: unknown;
 }
 
+const DEFAULT_RETRY_AFTER_MS = 1000;
+
 @Injectable()
 export class DiscordResponseClassifier {
   classify(response: DiscordHttpResponse): DeliveryResult {
-    if (response.statusCode >= 200 && response.statusCode < 300) {
-      return { type: 'success', statusCode: response.statusCode };
+    const { statusCode } = response;
+
+    if (statusCode >= 200 && statusCode < 300) {
+      return { type: 'success', statusCode };
     }
 
-    if (response.statusCode === 429) {
-      const retryAfterMs = this.readRetryAfterMs(response);
-
+    if (statusCode === 429) {
       return {
         type: 'rate_limited',
         statusCode: 429,
-        retryAfterMs,
-        rateLimitKey:
-          response.headers['x-ratelimit-bucket'] ?? 'discord-channel',
+        retryAfterMs: this.readRetryAfterMs(response),
       };
     }
 
-    if ([400, 401, 403, 404].includes(response.statusCode)) {
+    // 400 - неправильно составленный вебхук: повтор всегда даст ту же ошибку.
+    if (statusCode === 400) {
       return {
         type: 'permanent_failure',
-        statusCode: response.statusCode,
-        reason: `Discord returned permanent HTTP ${response.statusCode}`,
-      };
-    }
-
-    if (response.statusCode >= 500 && response.statusCode < 600) {
-      return {
-        type: 'retryable_failure',
-        reason: `Discord returned retryable HTTP ${response.statusCode}`,
+        statusCode,
+        reason: 'Discord rejected the webhook payload (HTTP 400)',
       };
     }
 
     return {
-      type: 'permanent_failure',
-      statusCode: response.statusCode,
-      reason: `Discord returned unexpected HTTP ${response.statusCode}`,
+      type: 'retryable_failure',
+      statusCode,
+      reason: `Discord returned HTTP ${statusCode}`,
     };
   }
 
+  /** Discord отдаёт retry_after (тело) и Retry-After (заголовок) в секундах. */
   private readRetryAfterMs(response: DiscordHttpResponse): number {
     const body = response.body;
     const bodyRetryAfter =
       typeof body === 'object' && body !== null && 'retry_after' in body
         ? body.retry_after
         : undefined;
-    const headerRetryAfter = response.headers['retry-after'];
-    const retryAfter = bodyRetryAfter ?? headerRetryAfter;
-    const retryAfterNumber = Number(retryAfter);
+    const seconds = Number(bodyRetryAfter ?? response.headers['retry-after']);
 
-    if (!Number.isFinite(retryAfterNumber) || retryAfterNumber < 0) {
-      return 1000;
+    if (!Number.isFinite(seconds) || seconds < 0) {
+      return DEFAULT_RETRY_AFTER_MS;
     }
 
-    return retryAfterNumber < 100 ? retryAfterNumber * 1000 : retryAfterNumber;
+    return Math.ceil(seconds * 1000);
   }
 }

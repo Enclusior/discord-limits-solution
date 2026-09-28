@@ -10,30 +10,44 @@ describe('DiscordResponseClassifier', () => {
     });
   });
 
-  it('uses body retry_after for 429', () => {
+  it('prefers body retry_after (seconds) for 429', () => {
     expect(
       classifier.classify({
         statusCode: 429,
-        headers: { 'retry-after': '0.5' },
+        headers: { 'retry-after': '1' },
         body: { retry_after: 1.73 },
       }),
-    ).toEqual({
-      type: 'rate_limited',
-      statusCode: 429,
-      retryAfterMs: 1730,
-      rateLimitKey: 'discord-channel',
-    });
+    ).toEqual({ type: 'rate_limited', statusCode: 429, retryAfterMs: 1730 });
   });
 
-  it('does not classify 400 as retryable', () => {
+  it('treats long Retry-After values as seconds too', () => {
+    expect(
+      classifier.classify({
+        statusCode: 429,
+        headers: { 'retry-after': '120' },
+      }),
+    ).toMatchObject({ type: 'rate_limited', retryAfterMs: 120000 });
+  });
+
+  it('falls back to one second when 429 has no usable Retry-After', () => {
+    expect(classifier.classify({ statusCode: 429, headers: {} })).toMatchObject(
+      { type: 'rate_limited', retryAfterMs: 1000 },
+    );
+  });
+
+  it('sends only 400 to DLX', () => {
     expect(classifier.classify({ statusCode: 400, headers: {} })).toMatchObject(
       { type: 'permanent_failure', statusCode: 400 },
     );
   });
 
-  it('classifies 5xx as retryable', () => {
-    expect(classifier.classify({ statusCode: 503, headers: {} })).toMatchObject(
-      { type: 'retryable_failure' },
-    );
-  });
+  it.each([401, 403, 404, 413, 500, 502, 503])(
+    'retries HTTP %i',
+    (statusCode) => {
+      expect(classifier.classify({ statusCode, headers: {} })).toMatchObject({
+        type: 'retryable_failure',
+        statusCode,
+      });
+    },
+  );
 });

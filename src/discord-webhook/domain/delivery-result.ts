@@ -7,7 +7,6 @@ export type DeliveryResult =
       type: 'rate_limited';
       statusCode: 429;
       retryAfterMs: number;
-      rateLimitKey: string;
     }
   | {
       type: 'permanent_failure';
@@ -16,6 +15,6 @@ export type DeliveryResult =
     }
   | {
       type: 'retryable_failure';
+      statusCode: number;
       reason: string;
-      error?: Error;
     };
