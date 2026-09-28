@@ -31,9 +31,10 @@ export const queueProviders: Provider[] = [
           // Ответы Discord обрабатываются явно и сюда не попадают.
           attempts: 15,
           backoff: { type: 'exponential', delay: 1000 },
-          // Завершённые задачи храним сутки: этого хватает, чтобы повторная
-          // публикация из outbox с тем же jobId не создала дубль.
-          removeOnComplete: { age: 24 * 60 * 60 },
+          // Завершённые задачи храним час: это с большим запасом дольше lease
+          // outbox (30 с), поэтому повторная публикация с тем же jobId не создаст
+          // дубль, а Redis не копит payload завершённых задач.
+          removeOnComplete: { age: 60 * 60 },
           removeOnFail: false,
         },
       }),
