@@ -24,6 +24,9 @@ export default () => ({
       process.env.DISCORD_RATE_LIMIT_CLEANUP_GRACE_MS ?? 1000,
     ),
     workerConcurrency: Number(process.env.DISCORD_WORKER_CONCURRENCY ?? 10),
+    dispatchLockTtlMs: Number(
+      process.env.DISCORD_DISPATCH_LOCK_TTL_MS ?? 15000,
+    ),
     requestTimeoutMs: Number(process.env.DISCORD_REQUEST_TIMEOUT_MS ?? 10000),
     retryMaxAttempts: Number(process.env.DISCORD_RETRY_MAX_ATTEMPTS ?? 5),
     retryBaseDelayMs: Number(process.env.DISCORD_RETRY_BASE_DELAY_MS ?? 1000),

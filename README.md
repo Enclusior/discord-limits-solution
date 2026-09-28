@@ -377,11 +377,11 @@ DISCORD_RATE_LIMIT_PER_SECOND=2
 
 1. читает body `retry_after`;
 2. учитывает header `Retry-After`;
-3. планирует delayed retry;
-4. не блокирует другие channels;
-5. сохраняет delivery attempt count.
+3. ставит паузу на весь `channelId` (остальные jobs этого канала не уходят в Discord в это окно);
+4. планирует delayed retry для текущего job;
+5. не блокирует другие channels.
 
-Exponential backoff не применяется вместо `Retry-After`.
+`429` не уходит в DLX по лимиту попыток: канал ждёт `Retry-After` и продолжает доставку. Exponential backoff не применяется вместо `Retry-After`.
 
 ### Retryable errors
 
@@ -553,17 +553,18 @@ npm run test:load -- --count=100 --poll-ms=500
 
 ### Что выводит load-test
 
-В процессе:
+В процессе (run-scoped через `?runId=`):
 
 ```text
-waiting
-active
-delayed
+produced
 completed
 failed
-dlxWaiting
 pending
+dlxWaiting
+accountedMatchesProduced
 ```
+
+Пока доставка идёт, ожидается `produced === completed + pending + failed`.
 
 В конце:
 
@@ -619,7 +620,7 @@ dlxWaiting: 0
 | Сценарий               | Что происходит                      | Ожидаемый результат                     |
 | ---------------------- | ----------------------------------- | --------------------------------------- |
 | `2xx`                  | job завершается                     | `completed + 1`                         |
-| `429`                  | чтение `Retry-After`, delayed retry | eventual success или DLX после лимита   |
+| `429`                  | пауза канала + `Retry-After`, delayed retry | eventual success; другие каналы не ждут |
 | `400`                  | permanent failure                   | DLX без retry loop                      |
 | `401/403/404`          | invalid/configuration destination   | DLX                                     |
 | `5xx`                  | exponential retry + jitter          | success или DLX                         |
@@ -772,6 +773,17 @@ PGPASSWORD=discord_app_password psql \
 
 ## Тесты проекта
 
+Полная проверка — это не одна команда. Слои разделены специально:
+
+| Команда | Что проверяет | Нужен стек |
+| ------- | ------------- | ---------- |
+| `npm test` / `npm run test:cov` | Unit: classifier, enqueue, mock Redis limiter, Hello World | нет |
+| `npm run test:redis-integration` | Lua limiter на реальном Redis | Redis |
+| `npm run test:e2e` | HTTP `GET /` | нет |
+| `npm run test:load` | Outbox → BullMQ → rate limit → Discord / DLX | Docker Compose + webhook |
+
+`npm test` и `npm run test:cov` **пропускают** Redis integration (`4 skipped`): suite включается только при `RUN_REDIS_INTEGRATION=1`, который выставляет `test:redis-integration`. Низкий процент в `test:cov` (~20%) ожидаем: unit-тесты не гоняют `WebhookProcessor`, outbox publisher, transport, demo/health. Эти пути закрываются redis-integration и load-test.
+
 Установить зависимости:
 
 ```powershell
@@ -819,7 +831,19 @@ docker compose up -d redis
 npm run test:redis-integration
 ```
 
-Она проверяет позднее событие после уже зарезервированной пачки, независимость каналов и автоматическое истечение limiter key после расписания.
+Она проверяет:
+
+- позднее событие после уже зарезервированной пачки встаёт в конец расписания (TTL хвоста);
+- независимость ключей разных каналов;
+- автоматическое истечение limiter key после последнего слота + grace;
+- после Discord `429` / `pauseChannel` dispatch блокируется для всего канала, другой канал продолжает работу.
+
+Нагрузочная проверка на живом стеке (см. [Нагрузочное тестирование](#нагрузочное-тестирование)):
+
+```powershell
+docker compose up -d --build
+npm run test:load -- --count=10 --channel=load-test-channel --send-summary=false
+```
 
 Compose validation:
 

@@ -8,6 +8,7 @@ export interface DiscordWebhookJob {
   createdAt: string;
   deliveryAttempts?: number;
   reservedAt?: number;
+  reservationEpoch?: number;
   deliveredAt?: string;
   metadata?: Record<string, string>;
 }

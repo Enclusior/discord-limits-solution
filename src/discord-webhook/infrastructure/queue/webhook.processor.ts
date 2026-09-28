@@ -48,6 +48,7 @@ export class WebhookProcessor {
       ? {
           delayMs: await this.limiter.getRemainingDelayMs(data.reservedAt),
           reservedAt: data.reservedAt,
+          reservationEpoch: data.reservationEpoch ?? 0,
         }
       : await this.limiter.reserve(data.channelId);
 
@@ -58,6 +59,26 @@ export class WebhookProcessor {
         'channel rate limit',
         false,
         reservation.reservedAt,
+        reservation.reservationEpoch,
+      );
+      return;
+    }
+
+    const dispatch = await this.limiter.acquireDispatch(
+      data.channelId,
+      reservation.reservationEpoch,
+    );
+    if (dispatch.status !== 'acquired') {
+      const nextReservation = await this.limiter.reserve(data.channelId);
+      await this.reschedule(
+        job,
+        nextReservation.delayMs,
+        dispatch.status === 'stale'
+          ? 'channel reservation invalidated'
+          : 'channel dispatch in progress',
+        false,
+        nextReservation.reservedAt,
+        nextReservation.reservationEpoch,
       );
       return;
     }
@@ -91,11 +112,15 @@ export class WebhookProcessor {
       }
 
       if (result.type === 'rate_limited') {
+        await this.limiter.pauseChannel(data.channelId, result.retryAfterMs);
+        const nextReservation = await this.limiter.reserve(data.channelId);
         await this.reschedule(
           job,
-          result.retryAfterMs,
+          nextReservation.delayMs,
           'Discord Retry-After',
           true,
+          nextReservation.reservedAt,
+          nextReservation.reservationEpoch,
         );
         return;
       }
@@ -111,6 +136,8 @@ export class WebhookProcessor {
         job,
         error instanceof Error ? error.message : 'Unknown transport error',
       );
+    } finally {
+      await this.limiter.releaseDispatch(data.channelId, dispatch.token);
     }
   }
 
@@ -120,6 +147,7 @@ export class WebhookProcessor {
     reason: string,
     countsAsDeliveryAttempt = false,
     reservedAt?: number,
+    reservationEpoch?: number,
   ): Promise<void> {
     const deliveryAttempts =
       (job.data.deliveryAttempts ?? 0) + Number(countsAsDeliveryAttempt);
@@ -127,6 +155,7 @@ export class WebhookProcessor {
       ...job.data,
       deliveryAttempts,
       reservedAt,
+      reservationEpoch,
     };
     await this.queue.add(job.name, scheduledData, {
       jobId: `${job.id ?? 'webhook'}-scheduled-${Date.now()}`,

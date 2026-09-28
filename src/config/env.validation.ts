@@ -23,6 +23,7 @@ export const environmentValidationSchema = Joi.object({
     .min(0)
     .default(1000),
   DISCORD_WORKER_CONCURRENCY: Joi.number().integer().min(1).default(10),
+  DISCORD_DISPATCH_LOCK_TTL_MS: Joi.number().integer().min(1000).default(15000),
   DISCORD_REQUEST_TIMEOUT_MS: Joi.number().integer().min(100).default(10000),
   DISCORD_RETRY_MAX_ATTEMPTS: Joi.number().integer().min(1).default(5),
   DISCORD_RETRY_BASE_DELAY_MS: Joi.number().integer().min(1).default(1000),

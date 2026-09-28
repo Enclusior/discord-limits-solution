@@ -21,6 +21,7 @@ describeRedisIntegration('RateLimiterService Redis integration', () => {
       getOrThrow: (key: string) => {
         if (key === 'discord.rateLimitPerSecond') return 2;
         if (key === 'discord.rateLimitCleanupGraceMs') return 1000;
+        if (key === 'discord.dispatchLockTtlMs') return 15000;
         throw new Error(`Unexpected config key: ${key}`);
       },
     } as ConfigService;
@@ -81,6 +82,54 @@ describeRedisIntegration('RateLimiterService Redis integration', () => {
       expect(await redis.exists(key)).toBe(0);
     } finally {
       await redis.del(key);
+    }
+  });
+
+  it('blocks all dispatches for a channel after Discord Retry-After', async () => {
+    const channelA = `${channelId}-429-a`;
+    const channelB = `${channelId}-429-b`;
+    const oldReservationA = await limiter.reserve(channelA);
+    const reservationB = await limiter.reserve(channelB);
+    let dispatchToken: string | undefined;
+
+    try {
+      const pause = await limiter.pauseChannel(channelA, 2000);
+
+      await expect(
+        limiter.acquireDispatch(channelA, oldReservationA.reservationEpoch),
+      ).resolves.toMatchObject({ status: 'stale' });
+
+      const blockedA = await limiter.acquireDispatch(
+        channelA,
+        pause.reservationEpoch,
+      );
+      expect(blockedA.status).toBe('blocked');
+      if (blockedA.status === 'blocked') {
+        expect(blockedA.delayMs).toBeGreaterThan(1500);
+      }
+
+      const dispatchB = await limiter.acquireDispatch(
+        channelB,
+        reservationB.reservationEpoch,
+      );
+      expect(dispatchB.status).toBe('acquired');
+      if (dispatchB.status === 'acquired') {
+        dispatchToken = dispatchB.token;
+      }
+    } finally {
+      if (dispatchToken) {
+        await limiter.releaseDispatch(channelB, dispatchToken);
+      }
+      await redis.del(
+        `discord-webhook:ratelimit:${channelA}`,
+        `discord-webhook:ratelimit:${channelA}:blocked-until`,
+        `discord-webhook:ratelimit:${channelA}:epoch`,
+        `discord-webhook:ratelimit:${channelA}:dispatch-lock`,
+        `discord-webhook:ratelimit:${channelB}`,
+        `discord-webhook:ratelimit:${channelB}:blocked-until`,
+        `discord-webhook:ratelimit:${channelB}:epoch`,
+        `discord-webhook:ratelimit:${channelB}:dispatch-lock`,
+      );
     }
   });
 });
