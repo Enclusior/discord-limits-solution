@@ -18,6 +18,10 @@ export const environmentValidationSchema = Joi.object({
   OUTBOX_BATCH_SIZE: Joi.number().integer().min(1).default(100),
   OUTBOX_LEASE_MS: Joi.number().integer().min(1000).default(30000),
   DISCORD_RATE_LIMIT_PER_SECOND: Joi.number().integer().min(1).default(2),
+  DISCORD_RATE_LIMIT_CLEANUP_GRACE_MS: Joi.number()
+    .integer()
+    .min(0)
+    .default(1000),
   DISCORD_WORKER_CONCURRENCY: Joi.number().integer().min(1).default(10),
   DISCORD_REQUEST_TIMEOUT_MS: Joi.number().integer().min(100).default(10000),
   DISCORD_RETRY_MAX_ATTEMPTS: Joi.number().integer().min(1).default(5),

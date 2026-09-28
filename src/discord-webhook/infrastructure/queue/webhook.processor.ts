@@ -46,7 +46,7 @@ export class WebhookProcessor {
     const { data } = job;
     const reservation = data.reservedAt
       ? {
-          delayMs: Math.max(0, data.reservedAt - Date.now()),
+          delayMs: await this.limiter.getRemainingDelayMs(data.reservedAt),
           reservedAt: data.reservedAt,
         }
       : await this.limiter.reserve(data.channelId);

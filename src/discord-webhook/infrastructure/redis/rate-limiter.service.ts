@@ -11,12 +11,15 @@ export interface RateLimitReservation {
 const RATE_LIMIT_LUA = `
 local key = KEYS[1]
 local interval_ms = tonumber(ARGV[1])
-local now_ms = tonumber(ARGV[2])
-local ttl_ms = tonumber(ARGV[3])
+local cleanup_grace_ms = tonumber(ARGV[2])
+local redis_time = redis.call('TIME')
+local now_ms = tonumber(redis_time[1]) * 1000 + math.floor(tonumber(redis_time[2]) / 1000)
 local next_allowed_at = tonumber(redis.call('GET', key) or '0')
 local reservation_at = math.max(now_ms, next_allowed_at)
+local next_slot_at = reservation_at + interval_ms
 local delay_ms = reservation_at - now_ms
-redis.call('SET', key, reservation_at + interval_ms, 'PX', ttl_ms)
+local ttl_ms = next_slot_at - now_ms + cleanup_grace_ms
+redis.call('SET', key, next_slot_at, 'PX', ttl_ms)
 return { delay_ms, reservation_at }
 `;
 
@@ -41,7 +44,9 @@ export class RateLimiterService {
       'discord.rateLimitPerSecond',
     );
     const intervalMs = Math.ceil(1000 / ratePerSecond);
-    const ttlMs = Math.max(intervalMs * 2, 1000);
+    const cleanupGraceMs = this.config.getOrThrow<number>(
+      'discord.rateLimitCleanupGraceMs',
+    );
     const key = `discord-webhook:ratelimit:${rateLimitKey}`;
     const scriptSha = await this.scriptShaPromise;
     const result = (await this.redis.evalsha(
@@ -49,13 +54,19 @@ export class RateLimiterService {
       1,
       key,
       intervalMs,
-      Date.now(),
-      ttlMs,
+      cleanupGraceMs,
     )) as [number, number];
 
     return {
       delayMs: Number(result[0]),
       reservedAt: Number(result[1]),
     };
+  }
+
+  async getRemainingDelayMs(reservedAt: number): Promise<number> {
+    const [seconds, microseconds] = await this.redis.time();
+    const redisNowMs =
+      Number(seconds) * 1000 + Math.floor(Number(microseconds) / 1000);
+    return Math.max(0, reservedAt - redisNowMs);
   }
 }

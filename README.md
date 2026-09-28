@@ -369,6 +369,8 @@ DISCORD_RATE_LIMIT_PER_SECOND=2
 - concurrency: сколько jobs может обрабатываться одновременно;
 - rate limit: сколько отправок разрешено за интервал времени.
 
+Для каждого канала Redis хранит только время следующего свободного слота. TTL покрывает всё уже зарезервированное расписание и дополнительный `DISCORD_RATE_LIMIT_CLEANUP_GRACE_MS`; поэтому новый event не теряет хвост очереди, а ключ автоматически удаляется после простоя. Время для reservation берётся у Redis, а не у часов конкретного worker.
+
 ### Discord `429`
 
 При `429` processor:
@@ -741,29 +743,30 @@ PGPASSWORD=discord_app_password psql \
 
 ## Конфигурация
 
-| Variable                        | Назначение                      | Default                        |
-| ------------------------------- | ------------------------------- | ------------------------------ |
-| `PORT`                          | HTTP port                       | `3000`                         |
-| `REDIS_HOST`                    | Redis host                      | `localhost`                    |
-| `REDIS_PORT`                    | Redis port                      | `6379`                         |
-| `POSTGRES_HOST`                 | PostgreSQL host                 | `localhost`                    |
-| `POSTGRES_PORT`                 | PostgreSQL port                 | `5432` внутри Docker           |
-| `POSTGRES_DB`                   | Database                        | `discord_limits`               |
-| `POSTGRES_USER`                 | User                            | `discord_app`                  |
-| `POSTGRES_PASSWORD`             | Password                        | `discord_app_password`         |
-| `POSTGRES_POOL_SIZE`            | PG pool size                    | `10`                           |
-| `OUTBOX_POLL_INTERVAL_MS`       | Publisher polling interval      | `1000`                         |
-| `OUTBOX_BATCH_SIZE`             | Outbox batch size               | `100`                          |
-| `OUTBOX_LEASE_MS`               | Lease timeout                   | `30000`                        |
-| `DISCORD_RATE_LIMIT_PER_SECOND` | Safety limit per channel        | `2`                            |
-| `DISCORD_WORKER_CONCURRENCY`    | Worker concurrency              | `10`                           |
-| `DISCORD_REQUEST_TIMEOUT_MS`    | HTTP timeout                    | `10000`                        |
-| `DISCORD_WAIT_FOR_MESSAGE`      | Ask Discord for message body/id | `true`                         |
-| `DISCORD_RETRY_MAX_ATTEMPTS`    | Retry limit                     | `5`                            |
-| `DISCORD_RETRY_BASE_DELAY_MS`   | Retry base delay                | `1000`                         |
-| `DISCORD_RETRY_MAX_DELAY_MS`    | Retry max delay                 | `30000`                        |
-| `DISCORD_WEBHOOK_A`             | Demo webhook A                  | required for demo              |
-| `DISCORD_WEBHOOK_B`             | Demo webhook B                  | required for both-channel demo |
+| Variable                              | Назначение                               | Default                        |
+| ------------------------------------- | ---------------------------------------- | ------------------------------ |
+| `PORT`                                | HTTP port                                | `3000`                         |
+| `REDIS_HOST`                          | Redis host                               | `localhost`                    |
+| `REDIS_PORT`                          | Redis port                               | `6379`                         |
+| `POSTGRES_HOST`                       | PostgreSQL host                          | `localhost`                    |
+| `POSTGRES_PORT`                       | PostgreSQL port                          | `5432` внутри Docker           |
+| `POSTGRES_DB`                         | Database                                 | `discord_limits`               |
+| `POSTGRES_USER`                       | User                                     | `discord_app`                  |
+| `POSTGRES_PASSWORD`                   | Password                                 | `discord_app_password`         |
+| `POSTGRES_POOL_SIZE`                  | PG pool size                             | `10`                           |
+| `OUTBOX_POLL_INTERVAL_MS`             | Publisher polling interval               | `1000`                         |
+| `OUTBOX_BATCH_SIZE`                   | Outbox batch size                        | `100`                          |
+| `OUTBOX_LEASE_MS`                     | Lease timeout                            | `30000`                        |
+| `DISCORD_RATE_LIMIT_PER_SECOND`       | Safety limit per channel                 | `2`                            |
+| `DISCORD_RATE_LIMIT_CLEANUP_GRACE_MS` | Limiter TTL grace после последнего слота | `1000`                         |
+| `DISCORD_WORKER_CONCURRENCY`          | Worker concurrency                       | `10`                           |
+| `DISCORD_REQUEST_TIMEOUT_MS`          | HTTP timeout                             | `10000`                        |
+| `DISCORD_WAIT_FOR_MESSAGE`            | Ask Discord for message body/id          | `true`                         |
+| `DISCORD_RETRY_MAX_ATTEMPTS`          | Retry limit                              | `5`                            |
+| `DISCORD_RETRY_BASE_DELAY_MS`         | Retry base delay                         | `1000`                         |
+| `DISCORD_RETRY_MAX_DELAY_MS`          | Retry max delay                          | `30000`                        |
+| `DISCORD_WEBHOOK_A`                   | Demo webhook A                           | required for demo              |
+| `DISCORD_WEBHOOK_B`                   | Demo webhook B                           | required for both-channel demo |
 
 `.env` не коммитится. Webhook URL нельзя публиковать или выводить в логи.
 
@@ -808,6 +811,15 @@ E2E:
 ```powershell
 npm run test:e2e
 ```
+
+Интеграционная проверка Lua limiter на реальном Redis:
+
+```bash
+docker compose up -d redis
+npm run test:redis-integration
+```
+
+Она проверяет позднее событие после уже зарезервированной пачки, независимость каналов и автоматическое истечение limiter key после расписания.
 
 Compose validation:
 

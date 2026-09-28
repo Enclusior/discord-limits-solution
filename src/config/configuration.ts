@@ -20,6 +20,9 @@ export default () => ({
   },
   discord: {
     rateLimitPerSecond: Number(process.env.DISCORD_RATE_LIMIT_PER_SECOND ?? 2),
+    rateLimitCleanupGraceMs: Number(
+      process.env.DISCORD_RATE_LIMIT_CLEANUP_GRACE_MS ?? 1000,
+    ),
     workerConcurrency: Number(process.env.DISCORD_WORKER_CONCURRENCY ?? 10),
     requestTimeoutMs: Number(process.env.DISCORD_REQUEST_TIMEOUT_MS ?? 10000),
     retryMaxAttempts: Number(process.env.DISCORD_RETRY_MAX_ATTEMPTS ?? 5),
