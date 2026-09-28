@@ -7,8 +7,8 @@ import {
 } from '@nestjs/common';
 import { Queue } from 'bullmq';
 import { ConfigService } from '@nestjs/config';
-import { createHash } from 'node:crypto';
 import { DiscordWebhookJob } from '@discord-webhook/domain/discord-webhook-job';
+import { toQueueJobId } from '@discord-webhook/domain/queue-job-id';
 import { WEBHOOK_QUEUE } from '@discord-webhook/infrastructure/queue/queue.providers';
 import { OutboxRecord, OutboxRepository } from './outbox.repository';
 
@@ -16,7 +16,9 @@ import { OutboxRecord, OutboxRepository } from './outbox.repository';
 export class OutboxPublisher implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(OutboxPublisher.name);
   private timer?: NodeJS.Timeout;
-  private publishing = false;
+  private running?: Promise<void>;
+  private rerunRequested = false;
+  private stopped = false;
 
   constructor(
     private readonly repository: OutboxRepository,
@@ -25,33 +27,55 @@ export class OutboxPublisher implements OnModuleInit, OnModuleDestroy {
   ) {}
 
   onModuleInit(): void {
+    // Polling - страховка: подбирает события после сбоев и истёкших lease.
     const intervalMs = this.config.getOrThrow<number>('outbox.pollIntervalMs');
-    this.timer = setInterval(() => void this.publishBatch(), intervalMs);
-    void this.publishBatch();
+    this.timer = setInterval(() => this.trigger(), intervalMs);
+    this.trigger();
   }
 
   async onModuleDestroy(): Promise<void> {
     if (this.timer) clearInterval(this.timer);
-    while (this.publishing)
-      await new Promise((resolve) => setTimeout(resolve, 10));
+    this.stopped = true;
+    await this.running;
+  }
+
+  /**
+   * Запускает публикацию сразу после записи события, без ожидания polling.
+   * Вызовы во время текущего прохода схлопываются в один повторный проход.
+   */
+  trigger(): void {
+    if (this.stopped) return;
+    if (this.running) {
+      this.rerunRequested = true;
+      return;
+    }
+    this.running = this.drain().finally(() => {
+      this.running = undefined;
+    });
+  }
+
+  private async drain(): Promise<void> {
+    do {
+      this.rerunRequested = false;
+      await this.publishBatch();
+    } while (this.rerunRequested && !this.stopped);
   }
 
   private async publishBatch(): Promise<void> {
-    if (this.publishing) return;
-    this.publishing = true;
     try {
+      const batchSize = this.config.getOrThrow<number>('outbox.batchSize');
       const batch = await this.repository.claimBatch(
-        this.config.getOrThrow<number>('outbox.batchSize'),
+        batchSize,
         this.config.getOrThrow<number>('outbox.leaseMs'),
       );
       await Promise.all(batch.map((record) => this.publish(record)));
+      // Полная пачка - вероятно, есть ещё события: забираем без ожидания.
+      if (batch.length === batchSize) this.rerunRequested = true;
     } catch (error) {
       this.logger.error({
         event: 'outbox.publisher.failed',
         reason: error instanceof Error ? error.message : 'unknown error',
       });
-    } finally {
-      this.publishing = false;
     }
   }
 
@@ -66,10 +90,10 @@ export class OutboxPublisher implements OnModuleInit, OnModuleDestroy {
     };
 
     try {
+      // Повторный add с тем же jobId BullMQ игнорирует, поэтому публикация
+      // после сбоя между add и markPublished не создаёт дубль.
       await this.queue.add('deliver-webhook', job, {
-        jobId: this.toQueueJobId(record.event_id),
-        removeOnComplete: 1000,
-        removeOnFail: false,
+        jobId: toQueueJobId(record.event_id),
       });
       await this.repository.markPublished(record.event_id);
       this.logger.log({
@@ -78,27 +102,10 @@ export class OutboxPublisher implements OnModuleInit, OnModuleDestroy {
         attempts: record.attempts,
       });
     } catch (error) {
-      if (this.isDuplicateJobError(error)) {
-        await this.repository.markPublished(record.event_id);
-        return;
-      }
       await this.repository.markForRetry(
         record.event_id,
         error instanceof Error ? error : new Error('unknown publisher error'),
       );
     }
-  }
-
-  private isDuplicateJobError(error: unknown): boolean {
-    return error instanceof Error && error.message.includes('already exists');
-  }
-
-  private toQueueJobId(eventId: string): string {
-    if (/^[a-zA-Z0-9_-]+$/.test(eventId)) {
-      return eventId;
-    }
-
-    const digest = createHash('sha256').update(eventId).digest('hex');
-    return `event-${digest}`;
   }
 }

@@ -6,32 +6,15 @@ import {
 } from '@nestjs/common';
 import { Pool } from 'pg';
 import { DiscordWebhookJob } from '@discord-webhook/domain/discord-webhook-job';
-import { POSTGRES_POOL } from '../infrastructure/postgres.provider';
+import { POSTGRES_POOL } from '@outbox/infrastructure/postgres.provider';
+import { OUTBOX_SCHEMA_SQL } from '@outbox/infrastructure/outbox.schema';
 
 @Injectable()
 export class OutboxRepository implements OnModuleInit, OnModuleDestroy {
   constructor(@Inject(POSTGRES_POOL) private readonly pool: Pool) {}
 
   async onModuleInit(): Promise<void> {
-    await this.pool.query(`
-      CREATE TABLE IF NOT EXISTS webhook_outbox_events (
-        event_id TEXT PRIMARY KEY,
-        channel_id TEXT NOT NULL,
-        webhook_url TEXT NOT NULL,
-        payload JSONB NOT NULL,
-        metadata JSONB,
-        status TEXT NOT NULL DEFAULT 'pending'
-          CHECK (status IN ('pending', 'publishing', 'published')),
-        attempts INTEGER NOT NULL DEFAULT 0,
-        available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        locked_until TIMESTAMPTZ,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        published_at TIMESTAMPTZ,
-        last_error TEXT
-      );
-      CREATE INDEX IF NOT EXISTS webhook_outbox_pending_idx
-        ON webhook_outbox_events (status, available_at);
-    `);
+    await this.pool.query(OUTBOX_SCHEMA_SQL);
   }
 
   async insertPendingEvent(job: DiscordWebhookJob): Promise<void> {
@@ -118,7 +101,9 @@ export class OutboxRepository implements OnModuleInit, OnModuleDestroy {
       `
         UPDATE webhook_outbox_events
         SET status = 'pending',
-            available_at = NOW() + INTERVAL '1 second',
+            -- Экспоненциальная задержка 2s, 4s, 8s ... не больше минуты.
+            available_at = NOW() + LEAST(POWER(2, LEAST(attempts, 6)) * 1000, 60000)
+              * INTERVAL '1 millisecond',
             locked_until = NULL,
             last_error = $2
         WHERE event_id = $1
