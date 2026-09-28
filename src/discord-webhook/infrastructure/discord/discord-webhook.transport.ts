@@ -1,4 +1,5 @@
 import { Injectable } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import axios, { AxiosError } from 'axios';
 import { DiscordWebhookPayload } from '@discord-webhook/domain/discord-webhook-payload';
 import { DiscordHttpResponse } from './discord-response-classifier';
@@ -6,17 +7,20 @@ import { WebhookTransport } from './webhook-transport';
 
 @Injectable()
 export class DiscordWebhookTransport implements WebhookTransport {
+  constructor(private readonly config: ConfigService) {}
+
   async send(
     webhookUrl: string,
     payload: DiscordWebhookPayload,
   ): Promise<DiscordHttpResponse> {
+    const url = new URL(webhookUrl);
+    if (this.config.getOrThrow<boolean>('discord.waitForMessage')) {
+      url.searchParams.set('wait', 'true');
+    }
+
     try {
-      const url = new URL(webhookUrl);
-      if (process.env.DISCORD_WAIT_FOR_MESSAGE !== 'false') {
-        url.searchParams.set('wait', 'true');
-      }
       const response = await axios.post(url.toString(), payload, {
-        timeout: Number(process.env.DISCORD_REQUEST_TIMEOUT_MS ?? 10000),
+        timeout: this.config.getOrThrow<number>('discord.requestTimeoutMs'),
         validateStatus: () => true,
       });
 

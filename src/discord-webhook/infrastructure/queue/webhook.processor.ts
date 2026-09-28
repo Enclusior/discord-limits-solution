@@ -1,219 +1,225 @@
-import { Inject, Injectable, Logger } from '@nestjs/common';
-import { Job, Queue, Worker } from 'bullmq';
+import {
+  Inject,
+  Injectable,
+  Logger,
+  OnModuleDestroy,
+  OnModuleInit,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { DiscordWebhookJob } from '@discord-webhook/domain/discord-webhook-job';
-import { DiscordResponseClassifier } from '@discord-webhook/infrastructure/discord/discord-response-classifier';
-import { WEBHOOK_DLX_QUEUE, WEBHOOK_QUEUE } from './queue.providers';
-import { RateLimiterService } from '@discord-webhook/infrastructure/redis/rate-limiter.service';
+import { Job, Queue, Worker } from 'bullmq';
+import {
+  DeliveryReceipt,
+  DiscordWebhookJob,
+} from '@discord-webhook/domain/discord-webhook-job';
+import { toQueueJobId } from '@discord-webhook/domain/queue-job-id';
+import {
+  DiscordHttpResponse,
+  DiscordResponseClassifier,
+} from '@discord-webhook/infrastructure/discord/discord-response-classifier';
 import { WEBHOOK_TRANSPORT } from '@discord-webhook/infrastructure/discord/webhook-transport';
 import type { WebhookTransport } from '@discord-webhook/infrastructure/discord/webhook-transport';
-import Redis from 'ioredis';
+import { RateLimiterService } from '@discord-webhook/infrastructure/redis/rate-limiter.service';
+import { DISCORD_WEBHOOK_QUEUE } from '@discord-webhook/infrastructure/redis/redis.constants';
 import {
-  REDIS_CLIENT,
-  DISCORD_WEBHOOK_QUEUE,
-} from '@discord-webhook/infrastructure/redis/redis.constants';
+  createQueueConnection,
+  WEBHOOK_DLX_QUEUE,
+  WEBHOOK_QUEUE,
+} from './queue.providers';
 
 @Injectable()
-export class WebhookProcessor {
+export class WebhookProcessor implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(WebhookProcessor.name);
-  private readonly worker: Worker<DiscordWebhookJob>;
+  private worker?: Worker<DiscordWebhookJob, DeliveryReceipt | undefined>;
 
   constructor(
     @Inject(WEBHOOK_QUEUE) private readonly queue: Queue<DiscordWebhookJob>,
-    @Inject(WEBHOOK_DLX_QUEUE)
-    private readonly dlxQueue: Queue,
+    @Inject(WEBHOOK_DLX_QUEUE) private readonly dlxQueue: Queue,
     @Inject(WEBHOOK_TRANSPORT) private readonly transport: WebhookTransport,
-    @Inject(REDIS_CLIENT) redis: Redis,
     private readonly limiter: RateLimiterService,
     private readonly classifier: DiscordResponseClassifier,
     private readonly config: ConfigService,
-  ) {
-    this.worker = new Worker(
-      DISCORD_WEBHOOK_QUEUE,
-      (job) => this.process(job),
-      {
-        connection: redis.duplicate(),
-        concurrency: config.getOrThrow<number>('discord.workerConcurrency'),
-      },
+  ) {}
+
+  onModuleInit(): void {
+    this.worker = new Worker(DISCORD_WEBHOOK_QUEUE, (job) => this.handle(job), {
+      connection: createQueueConnection(this.config),
+      concurrency: this.config.getOrThrow<number>('discord.workerConcurrency'),
+    });
+    this.worker.on('error', (error) =>
+      this.logger.error({
+        event: 'discord.webhook.worker_error',
+        reason: error.message,
+      }),
     );
   }
 
   async onModuleDestroy(): Promise<void> {
-    await this.worker.close();
+    await this.worker?.close();
   }
 
-  private async process(job: Job<DiscordWebhookJob>): Promise<void> {
+  async handle(
+    job: Job<DiscordWebhookJob>,
+  ): Promise<DeliveryReceipt | undefined> {
     const { data } = job;
-    const reservation = data.reservedAt
-      ? {
-          delayMs: await this.limiter.getRemainingDelayMs(data.reservedAt),
-          reservedAt: data.reservedAt,
-          reservationEpoch: data.reservationEpoch ?? 0,
-        }
-      : await this.limiter.reserve(data.channelId);
-
-    if (reservation.delayMs > 0) {
-      await this.reschedule(
-        job,
-        reservation.delayMs,
-        'channel rate limit',
-        false,
-        reservation.reservedAt,
-        reservation.reservationEpoch,
-      );
-      return;
-    }
-
-    const dispatch = await this.limiter.acquireDispatch(
+    const reservation =
+      data.reservation ?? (await this.limiter.reserve(data.channelId));
+    const permit = await this.limiter.acquireSendPermit(
       data.channelId,
-      reservation.reservationEpoch,
+      reservation,
     );
-    if (dispatch.status !== 'acquired') {
-      const nextReservation = await this.limiter.reserve(data.channelId);
-      await this.reschedule(
-        job,
-        nextReservation.delayMs,
-        dispatch.status === 'stale'
-          ? 'channel reservation invalidated'
-          : 'channel dispatch in progress',
-        false,
-        nextReservation.reservedAt,
-        nextReservation.reservationEpoch,
-      );
-      return;
+
+    if (permit.status === 'wait') {
+      // Задача не держит worker: ждёт своего слота как delayed job.
+      await this.reschedule(job, permit.delayMs, {
+        reservation: permit.reservation,
+      });
+      return undefined;
     }
 
-    const startedAt = Date.now();
-
+    let response: DiscordHttpResponse;
     try {
-      const response = await this.transport.send(data.webhookUrl, data.payload);
-      const result = this.classifier.classify(response);
-
-      if (result.type === 'success') {
-        await job.updateData({
-          ...data,
-          deliveredAt: new Date().toISOString(),
-        });
-        this.logger.log({
-          event: 'discord.webhook.sent',
-          eventId: data.eventId,
-          channelId: data.channelId,
-          jobId: job.id,
-          statusCode: result.statusCode,
-          discordMessageId:
-            typeof response.body === 'object' &&
-            response.body !== null &&
-            'id' in response.body
-              ? response.body.id
-              : undefined,
-          duration: Date.now() - startedAt,
-        });
-        return;
-      }
-
-      if (result.type === 'rate_limited') {
-        await this.limiter.pauseChannel(data.channelId, result.retryAfterMs);
-        const nextReservation = await this.limiter.reserve(data.channelId);
-        await this.reschedule(
-          job,
-          nextReservation.delayMs,
-          'Discord Retry-After',
-          true,
-          nextReservation.reservedAt,
-          nextReservation.reservationEpoch,
-        );
-        return;
-      }
-
-      if (result.type === 'permanent_failure') {
-        await this.deadLetter(job, result.reason, result.statusCode);
-        return;
-      }
-
-      await this.retryOrDeadLetter(job, result.reason);
+      response = await this.transport.send(data.webhookUrl, data.payload);
     } catch (error) {
-      await this.retryOrDeadLetter(
+      await this.retry(
         job,
         error instanceof Error ? error.message : 'Unknown transport error',
       );
-    } finally {
-      await this.limiter.releaseDispatch(data.channelId, dispatch.token);
+      return undefined;
+    }
+
+    const result = this.classifier.classify(response);
+    switch (result.type) {
+      case 'success':
+        return this.markDelivered(job, result.statusCode, response.body);
+      case 'rate_limited':
+        await this.limiter.pauseChannel(data.channelId, result.retryAfterMs);
+        // Слот задачи сдвинут вместе со всем расписанием канала;
+        // 429 - сигнал ожидания, попыткой доставки он не считается.
+        await this.reschedule(job, result.retryAfterMs, { reservation });
+        this.logger.warn({
+          event: 'discord.webhook.retry',
+          eventId: data.eventId,
+          channelId: data.channelId,
+          jobId: job.id,
+          retryAfterMs: result.retryAfterMs,
+          reason: 'Discord Retry-After',
+        });
+        return undefined;
+      case 'permanent_failure':
+        await this.deadLetter(
+          job,
+          result.reason,
+          (data.deliveryAttempts ?? 0) + 1,
+          result.statusCode,
+        );
+        return undefined;
+      case 'retryable_failure':
+        await this.retry(job, result.reason, result.statusCode);
+        return undefined;
     }
   }
 
-  private async reschedule(
+  private markDelivered(
     job: Job<DiscordWebhookJob>,
-    delayMs: number,
+    statusCode: number,
+    body: unknown,
+  ): DeliveryReceipt {
+    this.logger.log({
+      event: 'discord.webhook.sent',
+      eventId: job.data.eventId,
+      channelId: job.data.channelId,
+      jobId: job.id,
+      statusCode,
+      discordMessageId:
+        typeof body === 'object' && body !== null && 'id' in body
+          ? body.id
+          : undefined,
+    });
+    // Возвращаемое значение BullMQ сохраняет атомарно с завершением задачи.
+    return { deliveredAt: new Date().toISOString(), statusCode };
+  }
+
+  /** Любой ответ, кроме 2xx, 400 и 429, и сетевые ошибки: повтор с backoff. */
+  private async retry(
+    job: Job<DiscordWebhookJob>,
     reason: string,
-    countsAsDeliveryAttempt = false,
-    reservedAt?: number,
-    reservationEpoch?: number,
+    statusCode?: number,
   ): Promise<void> {
-    const deliveryAttempts =
-      (job.data.deliveryAttempts ?? 0) + Number(countsAsDeliveryAttempt);
-    const scheduledData: DiscordWebhookJob = {
-      ...job.data,
+    const deliveryAttempts = (job.data.deliveryAttempts ?? 0) + 1;
+    const maxAttempts = this.config.getOrThrow<number>(
+      'discord.retryMaxAttempts',
+    );
+
+    if (maxAttempts > 0 && deliveryAttempts >= maxAttempts) {
+      await this.deadLetter(job, reason, deliveryAttempts, statusCode);
+      return;
+    }
+
+    const delayMs = this.backoffDelayMs(deliveryAttempts);
+    // После backoff событие заново встаёт в конец расписания канала.
+    await this.reschedule(job, delayMs, {
       deliveryAttempts,
-      reservedAt,
-      reservationEpoch,
-    };
-    await this.queue.add(job.name, scheduledData, {
-      jobId: `${job.id ?? 'webhook'}-scheduled-${Date.now()}`,
-      delay: Math.max(1, delayMs),
-      removeOnComplete: 1000,
-      removeOnFail: false,
+      reservation: undefined,
     });
     this.logger.warn({
       event: 'discord.webhook.retry',
       eventId: job.data.eventId,
       channelId: job.data.channelId,
       jobId: job.id,
+      statusCode,
+      deliveryAttempts,
       retryAfterMs: delayMs,
       reason,
     });
   }
 
-  private async retryOrDeadLetter(
-    job: Job<DiscordWebhookJob>,
-    reason: string,
-  ): Promise<void> {
-    const attempts = (job.data.deliveryAttempts ?? 0) + 1;
-    const maxAttempts = this.config.getOrThrow<number>(
-      'discord.retryMaxAttempts',
-    );
-
-    if (attempts >= maxAttempts) {
-      await this.deadLetter(job, reason);
-      return;
-    }
-
+  private backoffDelayMs(deliveryAttempts: number): number {
     const baseDelay = this.config.getOrThrow<number>(
       'discord.retryBaseDelayMs',
     );
     const maxDelay = this.config.getOrThrow<number>('discord.retryMaxDelayMs');
     const exponentialDelay = Math.min(
       maxDelay,
-      baseDelay * 2 ** Math.max(0, attempts - 1),
+      baseDelay * 2 ** (deliveryAttempts - 1),
     );
-    const jitter = Math.floor(
-      Math.random() * Math.max(1, exponentialDelay / 4),
-    );
-    await this.reschedule(job, exponentialDelay + jitter, reason, true);
+    const jitter = Math.floor(Math.random() * (exponentialDelay / 4));
+    return exponentialDelay + jitter;
+  }
+
+  private async reschedule(
+    job: Job<DiscordWebhookJob>,
+    delayMs: number,
+    patch: Partial<DiscordWebhookJob>,
+  ): Promise<void> {
+    const rescheduleCount = (job.data.rescheduleCount ?? 0) + 1;
+    const data: DiscordWebhookJob = { ...job.data, ...patch, rescheduleCount };
+
+    // jobId детерминирован: если процесс упадёт после add, повторный запуск
+    // этой же задачи не создаст вторую копию.
+    await this.queue.add(job.name, data, {
+      jobId: toQueueJobId(data.eventId, rescheduleCount),
+      delay: Math.max(1, Math.ceil(delayMs)),
+    });
   }
 
   private async deadLetter(
     job: Job<DiscordWebhookJob>,
     reason: string,
+    attempts: number,
     statusCode?: number,
   ): Promise<void> {
-    await this.dlxQueue.add('dead-letter-webhook', {
-      ...job.data,
-      reason,
-      statusCode,
-      attempts: (job.data.deliveryAttempts ?? 0) + 1,
-      firstAttemptAt: job.data.createdAt,
-      lastAttemptAt: new Date().toISOString(),
-    });
+    await this.dlxQueue.add(
+      'dead-letter-webhook',
+      {
+        ...job.data,
+        reason,
+        statusCode,
+        attempts,
+        firstAttemptAt: job.data.createdAt,
+        lastAttemptAt: new Date().toISOString(),
+      },
+      { jobId: toQueueJobId(job.data.eventId) },
+    );
     this.logger.error({
       event: 'discord.webhook.dead_lettered',
       eventId: job.data.eventId,

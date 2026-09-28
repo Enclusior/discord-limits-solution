@@ -1,5 +1,9 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { Queue } from 'bullmq';
+import { Job, Queue } from 'bullmq';
+import {
+  DeliveryReceipt,
+  DiscordWebhookJob,
+} from '@discord-webhook/domain/discord-webhook-job';
 import {
   WEBHOOK_DLX_QUEUE,
   WEBHOOK_QUEUE,
@@ -26,7 +30,7 @@ export interface RunStats {
 @Injectable()
 export class QueueStatsService {
   constructor(
-    @Inject(WEBHOOK_QUEUE) private readonly queue: Queue,
+    @Inject(WEBHOOK_QUEUE) private readonly queue: Queue<DiscordWebhookJob>,
     @Inject(WEBHOOK_DLX_QUEUE) private readonly dlxQueue: Queue,
   ) {}
 
@@ -72,31 +76,38 @@ export class QueueStatsService {
       this.dlxQueue.getJobs(['waiting'], 0, -1, true),
     ]);
     const runJobs = jobs.filter((job) => job.data.metadata?.runId === runId);
-    const jobsByEventId = new Map(
-      runJobs.map((job) => [job.data.eventId, job]),
-    );
-    const uniqueRunJobs = [...jobsByEventId.values()];
-    const completed = uniqueRunJobs
-      .filter((job) => job.finishedOn)
-      .filter((job) => {
-        return job.data.deliveredAt !== undefined;
-      });
-    const failed = uniqueRunJobs.filter((job) => job.failedReason);
-    const pending = uniqueRunJobs.filter((job) => !job.finishedOn).length;
+    // У одного события несколько задач (каждый перенос - новая задача):
+    // состояние события - это состояние последней из них.
+    const latestByEventId = new Map<string, Job<DiscordWebhookJob>>();
+    for (const job of runJobs) {
+      const current = latestByEventId.get(job.data.eventId);
+      if (
+        !current ||
+        (job.data.rescheduleCount ?? 0) > (current.data.rescheduleCount ?? 0)
+      ) {
+        latestByEventId.set(job.data.eventId, job);
+      }
+    }
+    const events = [...latestByEventId.values()];
+    const delivered = events.flatMap((job) => {
+      const receipt = job.returnvalue as DeliveryReceipt | null | undefined;
+      return job.finishedOn && receipt?.deliveredAt
+        ? [{ job, deliveredAt: receipt.deliveredAt }]
+        : [];
+    });
+    const failed = events.filter((job) => job.failedReason && job.finishedOn);
+    const pending = events.filter((job) => !job.finishedOn).length;
     const runDlxJobs = dlxJobs.filter(
       (job) => job.data.metadata?.runId === runId,
     );
-    const deliveryDurations = completed.flatMap((job) => {
-      const createdAt = Date.parse(job.data.createdAt);
-      const deliveredAt = Date.parse(job.data.deliveredAt ?? '');
-      return Number.isFinite(createdAt) && Number.isFinite(deliveredAt)
-        ? [deliveredAt - createdAt]
-        : [];
+    const deliveryDurations = delivered.flatMap(({ job, deliveredAt }) => {
+      const duration = Date.parse(deliveredAt) - Date.parse(job.data.createdAt);
+      return Number.isFinite(duration) ? [duration] : [];
     });
 
     return {
-      produced: uniqueRunJobs.length,
-      completed: completed.length,
+      produced: events.length,
+      completed: delivered.length,
       failed: failed.length + runDlxJobs.length,
       pending,
       dlxWaiting: runDlxJobs.length,

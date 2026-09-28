@@ -1,7 +1,6 @@
 import { Provider } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { Queue } from 'bullmq';
-import Redis from 'ioredis';
+import { ConnectionOptions, Queue } from 'bullmq';
 import {
   DISCORD_WEBHOOK_DLX_QUEUE,
   DISCORD_WEBHOOK_QUEUE,
@@ -10,13 +9,15 @@ import {
 export const WEBHOOK_QUEUE = Symbol('WEBHOOK_QUEUE');
 export const WEBHOOK_DLX_QUEUE = Symbol('WEBHOOK_DLX_QUEUE');
 
-const createConnection = (config: ConfigService): Redis =>
-  new Redis({
-    host: config.getOrThrow<string>('redis.host'),
-    port: config.getOrThrow<number>('redis.port'),
-    password: config.get<string>('redis.password'),
-    maxRetriesPerRequest: null,
-  });
+// Параметры, а не готовый клиент: так BullMQ сам закрывает соединение в close().
+export const createQueueConnection = (
+  config: ConfigService,
+): ConnectionOptions => ({
+  host: config.getOrThrow<string>('redis.host'),
+  port: config.getOrThrow<number>('redis.port'),
+  password: config.get<string>('redis.password'),
+  maxRetriesPerRequest: null,
+});
 
 export const queueProviders: Provider[] = [
   {
@@ -24,7 +25,17 @@ export const queueProviders: Provider[] = [
     inject: [ConfigService],
     useFactory: (config: ConfigService): Queue =>
       new Queue(DISCORD_WEBHOOK_QUEUE, {
-        connection: createConnection(config),
+        connection: createQueueConnection(config),
+        defaultJobOptions: {
+          // Повторы на случай сбоя инфраструктуры (Redis) внутри обработчика.
+          // Ответы Discord обрабатываются явно и сюда не попадают.
+          attempts: 15,
+          backoff: { type: 'exponential', delay: 1000 },
+          // Завершённые задачи храним сутки: этого хватает, чтобы повторная
+          // публикация из outbox с тем же jobId не создала дубль.
+          removeOnComplete: { age: 24 * 60 * 60 },
+          removeOnFail: false,
+        },
       }),
   },
   {
@@ -32,7 +43,7 @@ export const queueProviders: Provider[] = [
     inject: [ConfigService],
     useFactory: (config: ConfigService): Queue =>
       new Queue(DISCORD_WEBHOOK_DLX_QUEUE, {
-        connection: createConnection(config),
+        connection: createQueueConnection(config),
       }),
   },
 ];
