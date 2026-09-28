@@ -28,12 +28,12 @@
 
 Прямой HTTP-вызов Discord Webhook плохо подходит для большого потока событий:
 
-- Discord ограничивает частоту запросов;
+- Discord разрешает около 2 запросов в секунду на канал;
 - `429 Too Many Requests` нельзя считать окончательной ошибкой;
 - сетевой timeout оставляет неоднозначный результат: Discord мог принять сообщение;
-- один медленный канал не должен блокировать другой;
+- один загруженный канал не должен задерживать другой;
 - процесс может упасть между созданием события и фактической доставкой;
-- конфигурационные ошибки webhook не должны создавать бесконечный retry loop.
+- некорректно составленный webhook (`400`) не должен создавать бесконечный retry loop.
 
 Модуль разделяет эти ответственности:
 
@@ -44,18 +44,18 @@ Business application
         v
 PostgreSQL transactional outbox
         |
-        | publisher with lease
+        | immediate publish + polling fallback
         v
 BullMQ: discord-webhooks  <---->  Redis
         |
-        | per-channel atomic reservation
+        | per-channel schedule + send permit (Redis Lua)
         v
 Discord Webhook transport
         |
-        +--> success
-        +--> Retry-After / delayed retry
-        +--> retryable failure
-        +--> DLX
+        +--> 2xx  -> delivered
+        +--> 429  -> pause whole channel for Retry-After
+        +--> 400  -> DLX
+        +--> other / network error -> retry with backoff
 ```
 
 Главная идея: очередь сама по себе не решает rate limit, а rate limiter сам по себе не решает durable delivery. BullMQ отвечает за jobs и scheduling, Redis за распределённую координацию, PostgreSQL за durable handoff, transport за Discord HTTP semantics.
@@ -64,23 +64,23 @@ Discord Webhook transport
 
 ### Гарантируется
 
-- одна durable очередь для webhook jobs;
-- отдельная DLX queue для необрабатываемых событий;
-- safety limit по умолчанию `2 webhook/sec` на каждый `channelId`;
-- независимая обработка Channel A и Channel B;
-- атомарная reservation слота через Redis Lua;
-- delayed reschedule вместо удержания worker через долгий `sleep`;
-- Discord `429` с использованием `Retry-After`;
-- ограниченный retry для `5xx`, timeout и network failures;
-- `400`, `401`, `403`, `404` как permanent failure в DLX;
-- сохранение событий в PostgreSQL до публикации в BullMQ;
-- восстановление outbox после падения publisher/application;
+- не более `2 webhook/sec` на каждый `channelId`, равномерно, даже при нескольких worker-инстансах;
+- новое событие встаёт в конец уже зарезервированного расписания канала, а не уходит сразу;
+- каналы независимы: ожидание одного канала не занимает worker-ы и не задерживает другой;
+- Discord `429`: пауза всего канала на `Retry-After`, всё уже выданное расписание канала сдвигается на эту паузу;
+- в DLX уходит только `400` (некорректный webhook), с логированием;
+- все остальные ошибки (`401`, `403`, `404`, `5xx`, timeout, network) повторяются с exponential backoff + jitter, без потери события;
+- delayed reschedule вместо удержания worker через `sleep`;
+- событие сохраняется в PostgreSQL до публикации в BullMQ и публикуется сразу после записи;
+- восстановление после падения приложения, publisher, worker или перезапуска Redis;
 - at-least-once delivery semantics;
 - логирование Discord `message.id`, если включён `DISCORD_WAIT_FOR_MESSAGE=true`.
 
 ### Не гарантируется
 
-Exactly-once доставка в Discord невозможна через обычный HTTP Webhook без idempotency API на стороне Discord. Если Discord принял сообщение, но TCP-соединение оборвалось до ответа, retry может создать duplicate message.
+Exactly-once доставка в Discord невозможна через обычный HTTP Webhook без idempotency API на стороне Discord. Если Discord принял сообщение, но соединение оборвалось до ответа, retry может создать duplicate message.
+
+Строгий порядок сообщений внутри канала тоже не гарантируется: события, которые ушли в retry после ошибки, встают в конец расписания.
 
 ## Быстрый запуск
 
@@ -94,14 +94,14 @@ Exactly-once доставка в Discord невозможна через обы�
 
 ### 1. Создать `.env`
 
-Из корня проекта:
+PowerShell:
 
 ```powershell
 Copy-Item .env.example .env
 notepad .env
 ```
 
-Для macOS/Linux:
+macOS/Linux:
 
 ```bash
 cp .env.example .env
@@ -121,37 +121,25 @@ DISCORD_WEBHOOK_B=https://discord.com/api/webhooks/...
 
 Первый запуск или запуск после изменения кода:
 
-```powershell
+```bash
 docker compose up -d --build
 ```
 
 Если менялся только `.env`:
 
-```powershell
+```bash
 docker compose up -d --force-recreate
-```
-
-Если код и зависимости не менялись:
-
-```powershell
-docker compose up -d
 ```
 
 Compose запускает:
 
 - `app` на `http://localhost:3000`;
-- Redis для BullMQ/rate limiter;
-- PostgreSQL на `localhost:5444` для подключения с Windows.
+- Redis для BullMQ и rate limiter; с хоста доступен на `localhost:6380` (`REDIS_HOST_PORT`);
+- PostgreSQL; с хоста доступен на `localhost:5444`.
 
-Внутри Docker приложение подключается к PostgreSQL как `postgres:5432`.
+Внутри Docker приложение подключается к `redis:6379` и `postgres:5432`. Таблица outbox создаётся приложением при старте.
 
 ### 3. Проверить контейнеры
-
-```powershell
-docker compose ps
-```
-
-Для macOS/Linux используется та же команда:
 
 ```bash
 docker compose ps
@@ -169,8 +157,8 @@ postgres  healthy
 
 Health endpoint проверяет оба persistence-компонента:
 
-```powershell
-Invoke-RestMethod "http://localhost:3000/health"
+```bash
+curl http://localhost:3000/health
 ```
 
 Ожидаемый результат:
@@ -185,20 +173,14 @@ Invoke-RestMethod "http://localhost:3000/health"
 
 Логи приложения:
 
-```powershell
-docker compose logs -f app
-```
-
-На macOS/Linux команда идентична:
-
 ```bash
 docker compose logs -f app
 ```
 
 Общий статус очередей:
 
-```powershell
-Invoke-RestMethod "http://localhost:3000/demo/queue-status"
+```bash
+curl http://localhost:3000/demo/queue-status
 ```
 
 ## Архитектура
@@ -213,53 +195,53 @@ Invoke-RestMethod "http://localhost:3000/demo/queue-status"
 +----------------------+
 | EnqueueWebhookService|
 +----------+-----------+
-           |
+           |  INSERT, затем trigger()
            v
 +------------------------------+
-| PostgreSQL Outbox             |
+| PostgreSQL Outbox            |
 | pending -> publishing ->     |
-| published                     |
+| published                    |
 +--------------+---------------+
                |
                v
 +------------------------------+
-| OutboxPublisher               |
-| lease + SKIP LOCKED           |
+| OutboxPublisher              |
+| lease + SKIP LOCKED          |
 +--------------+---------------+
                |
                v
 +------------------------------+
-| BullMQ discord-webhooks       |
+| BullMQ discord-webhooks      |
 +--------------+---------------+
                |
                v
 +------------------------------+
-| WebhookProcessor              |
-| concurrency configurable      |
+| WebhookProcessor             |
+| concurrency configurable     |
 +------+-----------------------+
        |
-       +--> Redis Lua limiter per channel
+       +--> RateLimiterService (Redis Lua, per channel)
        |
        +--> DiscordWebhookTransport
        |
-       +--> ResponseClassifier
+       +--> DiscordResponseClassifier
        |
        +--> DLX discord-webhooks-dlx
 ```
 
 ### Основные границы ответственности
 
-| Компонент               | Ответственность                                        |
-| ----------------------- | ------------------------------------------------------ |
-| `EnqueueWebhookService` | Сохранить событие в PostgreSQL outbox                  |
-| `OutboxRepository`      | Insert, lease, retry и published state                 |
-| `OutboxPublisher`       | Перенести outbox event в BullMQ                        |
-| BullMQ                  | Durable jobs, delayed scheduling и worker coordination |
-| Redis Lua limiter       | Atomic per-channel reservation                         |
-| `WebhookProcessor`      | State machine доставки                                 |
-| Discord transport       | HTTP request, headers и response body                  |
-| Response classifier     | `2xx`, `429`, permanent и retryable errors             |
-| DLX                     | Полный envelope окончательно не доставленного события  |
+| Компонент                   | Ответственность                                                  |
+| --------------------------- | ---------------------------------------------------------------- |
+| `EnqueueWebhookService`     | Сохранить событие в outbox и сразу запустить публикацию          |
+| `OutboxRepository`          | Схема, insert, lease, retry и published state                    |
+| `OutboxPublisher`           | Перенести outbox event в BullMQ; polling как страховка           |
+| BullMQ                      | Durable jobs, delayed scheduling и worker coordination           |
+| `RateLimiterService`        | Расписание канала, разрешение на отправку, пауза канала по `429` |
+| `WebhookProcessor`          | State machine доставки                                           |
+| `DiscordWebhookTransport`   | HTTP request, headers и response body                            |
+| `DiscordResponseClassifier` | `2xx`, `429`, `400` и retryable ответы                           |
+| DLX                         | Полный envelope некорректного события                            |
 
 ## Почему выбран этот стек
 
@@ -274,7 +256,7 @@ BullMQ уже решает нужные задачи:
 - coordination нескольких worker-инстансов;
 - понятные queue metrics.
 
-Kafka здесь избыточен: проекту не нужна event-streaming платформа и replay log на огромных объёмах. RabbitMQ возможен, но добавил бы ещё один инфраструктурный компонент, а per-channel rate limiter всё равно пришлось бы реализовывать отдельно.
+Kafka здесь избыточна: проекту не нужна event-streaming платформа и replay log на огромных объёмах. RabbitMQ возможен, но добавил бы ещё один инфраструктурный компонент, а per-channel rate limiter всё равно пришлось бы реализовывать отдельно.
 
 ### Почему Redis
 
@@ -283,7 +265,7 @@ Redis используется сразу для двух связанных з�
 1. BullMQ backend.
 2. Распределённое состояние rate limiter.
 
-Lua script делает check-and-reserve атомарным. Поэтому Worker A и Worker B не смогут одновременно забрать один и тот же слот одного канала.
+Lua script выполняет check-and-reserve атомарно. Поэтому Worker A и Worker B не смогут одновременно забрать один и тот же слот одного канала или отправить в канал чаще лимита.
 
 ### Почему не BullMQ global limiter
 
@@ -323,18 +305,16 @@ queue.add() fails
 => бизнес-данные сохранены, webhook event потерян
 ```
 
-С outbox:
+С outbox событие сначала надёжно записывается в PostgreSQL, а в очередь попадает асинхронно:
 
 ```text
-DB transaction + outbox INSERT
-              |
-             COMMIT
-              |
-              v
-       asynchronous publisher
-              |
-              v
-            BullMQ
+outbox INSERT (COMMIT)
+        |
+        v
+publisher: сразу после INSERT + polling раз в секунду
+        |
+        v
+      BullMQ
 ```
 
 Если publisher упал, запись остаётся в PostgreSQL и будет обработана после lease expiration.
@@ -343,11 +323,11 @@ DB transaction + outbox INSERT
 
 `await sleep(5000)` внутри worker удерживает concurrency slot. При большом потоке это блокирует обработку других каналов.
 
-Вместо этого job переводится в delayed state. Worker освобождается, а Redis reservation сохраняется в `reservedAt`.
+Вместо этого job переводится в delayed state до своего слота. Worker освобождается, а зарезервированный слот хранится в данных job.
 
 ## Rate limiting и retry
 
-### Per-channel limit
+### Расписание канала
 
 По умолчанию:
 
@@ -355,7 +335,7 @@ DB transaction + outbox INSERT
 DISCORD_RATE_LIMIT_PER_SECOND=2
 ```
 
-Это даёт примерно равномерное расписание:
+Каждое событие при первой обработке резервирует слот в расписании своего канала. Слоты идут с интервалом `1000 / DISCORD_RATE_LIMIT_PER_SECOND` мс:
 
 ```text
 0ms
@@ -364,41 +344,60 @@ DISCORD_RATE_LIMIT_PER_SECOND=2
 1500ms
 ```
 
-`DISCORD_WORKER_CONCURRENCY=10` не заменяет rate limit. Concurrency и rate limit решают разные задачи:
+Состояние канала хранится в одном Redis hash `discord-webhook:channel:<channelId>`:
 
-- concurrency: сколько jobs может обрабатываться одновременно;
-- rate limit: сколько отправок разрешено за интервал времени.
+| Поле      | Значение                                     |
+| --------- | -------------------------------------------- |
+| `next`    | время следующего свободного слота            |
+| `blocked` | до какого момента канал на паузе после `429` |
+| `shift`   | суммарный сдвиг расписания из-за пауз        |
+| `last`    | время последней фактической отправки в канал |
 
-Для каждого канала Redis хранит только время следующего свободного слота. TTL покрывает всё уже зарезервированное расписание и дополнительный `DISCORD_RATE_LIMIT_CLEANUP_GRACE_MS`; поэтому новый event не теряет хвост очереди, а ключ автоматически удаляется после простоя. Время для reservation берётся у Redis, а не у часов конкретного worker.
+TTL ключа покрывает всё зарезервированное расписание плюс `DISCORD_RATE_LIMIT_CLEANUP_GRACE_MS`, поэтому поздний event не теряет хвост очереди, а ключ удаляется после простоя. Время берётся у Redis (`TIME`), а не у часов конкретного worker.
+
+Пример: в `12:00:00` пришло 6 событий, они получают слоты `12:00:00.000 … 12:00:02.500`. Если в `12:00:01.200` приходит седьмое, оно встаёт после шестого, в `12:00:03.000`, а не уходит сразу.
+
+### Разрешение на отправку
+
+Перед HTTP-запросом worker атомарно получает разрешение (`acquireSendPermit`). Оно выдаётся, только если:
+
+1. наступил слот события (с учётом сдвига после пауз);
+2. канал не на паузе после `429`;
+3. с прошлой отправки в канал прошло не меньше интервала.
+
+Иначе job откладывается ровно на оставшееся время. Третье условие защищает от всплесков: если worker-ы отстали и несколько jobs канала проснулись после своих слотов, они всё равно уходят не чаще лимита.
+
+`DISCORD_WORKER_CONCURRENCY=10` не заменяет rate limit. Concurrency — сколько jobs обрабатывается одновременно, rate limit — сколько отправок разрешено за интервал.
 
 ### Discord `429`
 
 При `429` processor:
 
-1. читает body `retry_after`;
-2. учитывает header `Retry-After`;
-3. ставит паузу на весь `channelId` (остальные jobs этого канала не уходят в Discord в это окно);
-4. планирует delayed retry для текущего job;
-5. не блокирует другие channels.
+1. читает `retry_after` из body (секунды), иначе заголовок `Retry-After` (секунды);
+2. ставит паузу на весь `channelId`: пока пауза не закончилась, ни одна job этого канала не получит разрешение на отправку;
+3. сдвигает на длительность паузы всё уже выданное расписание канала, сохраняя интервал между слотами, поэтому после паузы канал продолжает в том же темпе, без дыр и без очереди из «проснувшихся» jobs;
+4. откладывает текущую job, сохранив её слот;
+5. не влияет на другие channels.
 
-`429` не уходит в DLX по лимиту попыток: канал ждёт `Retry-After` и продолжает доставку. Exponential backoff не применяется вместо `Retry-After`.
+`429` — сигнал ожидания, а не ошибка события: он не расходует попытки и никогда не приводит в DLX.
 
-### Retryable errors
+### Остальные ошибки
 
-Для network errors и `5xx` используется ограниченный backoff:
+Всё, кроме `2xx`, `400` и `429` — `401`, `403`, `404`, `5xx`, timeout и network errors — повторяется с exponential backoff и jitter:
 
 ```text
 base delay
 2 * base delay
 4 * base delay
-8 * base delay
+...
+не больше DISCORD_RETRY_MAX_DELAY_MS
 ```
 
-Добавляется jitter, чтобы несколько worker-ов не повторяли запросы одновременно.
+После задержки событие заново встаёт в конец расписания канала. По умолчанию `DISCORD_RETRY_MAX_ATTEMPTS=0`: повторы продолжаются до успешной доставки. Если задать положительное значение, после этого числа попыток событие уйдёт в DLX.
 
-### Permanent errors
+### `400` и DLX
 
-Ошибки `400`, `401`, `403`, `404` не ретраятся бесконечно. Полный envelope отправляется в DLX:
+`400` означает неправильно составленный webhook: повтор всегда даст ту же ошибку. Такое событие логируется (`discord.webhook.dead_lettered`) и сразу отправляется в DLX с полным envelope:
 
 - `eventId`;
 - `channelId`;
@@ -411,16 +410,7 @@ base delay
 
 ## Transactional outbox
 
-Таблица `webhook_outbox_events` хранит:
-
-- исходный event;
-- destination;
-- payload;
-- metadata;
-- status;
-- attempts;
-- lease;
-- last error.
+Таблица `webhook_outbox_events` хранит исходный event, destination, payload, metadata, status, attempts, lease и last error. Схема создаётся приложением при старте (`CREATE TABLE IF NOT EXISTS`).
 
 Статусы:
 
@@ -430,141 +420,92 @@ pending -> publishing -> published
 
 Publisher использует:
 
-- `FOR UPDATE SKIP LOCKED`;
-- lease timeout;
-- deterministic BullMQ job id;
-- `ON CONFLICT DO NOTHING` для duplicate enqueue.
+- немедленный запуск после каждого INSERT (вызовы во время публикации схлопываются в один повторный проход);
+- polling раз в `OUTBOX_POLL_INTERVAL_MS` как страховку;
+- `FOR UPDATE SKIP LOCKED` и lease timeout;
+- exponential backoff (до минуты), если Redis недоступен;
+- детерминированный BullMQ job id из `eventId`;
+- `ON CONFLICT DO NOTHING` для повторного enqueue того же `eventId`.
 
-Если publisher упал после `queue.add`, повторный duplicate job считается уже опубликованным. Если publisher упал до `queue.add`, lease истечёт и событие будет взято снова.
+Если publisher упал до `queue.add`, lease истечёт и событие будет взято снова. Если он упал после `queue.add`, но до `markPublished`, повторный `queue.add` с тем же job id BullMQ проигнорирует: завершённые jobs хранятся сутки, этого с запасом хватает, чтобы lease (`30s` по умолчанию) истёк раньше.
+
+Каждый перенос job (ожидание слота, `429`, retry) создаёт новую delayed job с детерминированным id `<eventId>--r<N>`, поэтому повторный запуск job после падения worker тоже не создаёт копию.
+
+`EnqueueWebhookService` пишет в outbox через собственный pool. Чтобы запись события была атомарной с изменением бизнес-данных, INSERT в outbox нужно выполнять в той же транзакции, что и бизнес-изменения (см. [Production considerations](#production-considerations)).
 
 ## Demo API
 
-Все HTTP-команды ниже можно выполнить через `curl` на macOS/Linux. На Windows удобнее использовать `Invoke-RestMethod`, приведённый в PowerShell-примерах.
+Входные данные валидируются (`class-validator`): `webhookUrl` принимается только в формате `https://discord.com/api/webhooks/...`, некорректный запрос получает `400` от API.
 
 ### Одно событие
 
-```powershell
-$body = @{
-  eventId = 'user:123:registered'
-  channelId = 'new-users'
-  webhookUrl = $env:DISCORD_WEBHOOK_A
-  payload = @{
-    embeds = @(
-      @{
-        title = 'New user'
-        description = 'User registered'
-      }
-    )
-  }
-} | ConvertTo-Json -Depth 8
-
-Invoke-RestMethod `
-  -Uri 'http://localhost:3000/demo/webhook' `
-  -Method Post `
-  -ContentType 'application/json' `
-  -Body $body
+```bash
+curl -X POST http://localhost:3000/demo/webhook \
+  -H 'content-type: application/json' \
+  -d '{
+    "eventId": "user-123-registered",
+    "channelId": "new-users",
+    "webhookUrl": "https://discord.com/api/webhooks/...",
+    "payload": { "embeds": [{ "title": "New user", "description": "User registered" }] }
+  }'
 ```
 
 ### Burst одного канала
 
-```powershell
-$body = @{ count = 10; channelId = 'channel-a' } | ConvertTo-Json
-Invoke-RestMethod `
-  -Uri 'http://localhost:3000/demo/burst' `
-  -Method Post `
-  -ContentType 'application/json' `
-  -Body $body
+```bash
+curl -X POST http://localhost:3000/demo/burst \
+  -H 'content-type: application/json' \
+  -d '{ "count": 10, "channelId": "channel-a" }'
 ```
 
 ### Burst двух независимых channels
 
-```powershell
-$body = @{ count = 10 } | ConvertTo-Json
-Invoke-RestMethod `
-  -Uri 'http://localhost:3000/demo/burst-both' `
-  -Method Post `
-  -ContentType 'application/json' `
-  -Body $body
+```bash
+curl -X POST http://localhost:3000/demo/burst-both \
+  -H 'content-type: application/json' \
+  -d '{ "count": 10 }'
 ```
 
 ### Queue status
 
-```powershell
-Invoke-RestMethod 'http://localhost:3000/demo/queue-status'
+```bash
+curl http://localhost:3000/demo/queue-status
+curl "http://localhost:3000/demo/queue-status?runId=load-..."
 ```
 
-### Run-scoped metrics
+Run-scoped статус считает события по последней job каждого события: `pending` — ещё не доставленные (waiting, active, delayed), `completed` — доставленные, `failed` — ушедшие в DLX или failed.
 
-Нагрузочный скрипт генерирует `runId` и получает статистику только своего запуска:
+На Windows вместо `curl` удобно использовать `Invoke-RestMethod`:
 
 ```powershell
-Invoke-RestMethod 'http://localhost:3000/demo/queue-status?runId=load-...'
+Invoke-RestMethod -Uri 'http://localhost:3000/demo/burst' -Method Post `
+  -ContentType 'application/json' -Body '{ "count": 10, "channelId": "channel-a" }'
 ```
 
 ## Нагрузочное тестирование
 
-Нагрузочный скрипт запускается в отдельном PowerShell, пока Docker Compose работает в первом.
-
-### 30 событий одного канала
-
-```powershell
-npm run test:load -- --count=30 --channel=load-test-channel
-```
-
-macOS/Linux:
+Нагрузочный скрипт запускается в отдельном терминале при работающем Docker Compose. Скрипт сам завершается, когда доставка закончена: `pending = 0` и `produced = completed + failed`.
 
 ```bash
+# 30 событий одного канала
 npm run test:load -- --count=30 --channel=load-test-channel
-```
 
-### 500 событий одного канала
-
-```powershell
+# 500 событий одного канала (при 2/sec это около 4-5 минут)
 npm run test:load -- --count=500 --channel=load-test-channel
-```
 
-При лимите `2/sec` 500 событий займут около 4-5 минут. Это ожидаемо: тест проверяет соблюдение внешнего ограничения и отсутствие потерь.
-
-### Два канала параллельно
-
-```powershell
+# По 500 событий в Channel A и Channel B параллельно
 npm run test:load -- --count=500 --both=true
-```
 
-macOS/Linux:
-
-```bash
-npm run test:load -- --count=500 --both=true
-```
-
-Будет создано по 500 jobs на Channel A и Channel B. При двух webhook URL оба канала должны обрабатываться параллельно.
-
-### Отключить summary webhook
-
-```powershell
+# Без итогового summary webhook
 npm run test:load -- --count=30 --channel=load-test-channel --send-summary=false
-```
 
-### Указать interval polling
-
-```powershell
+# Другой интервал опроса статуса
 npm run test:load -- --count=100 --poll-ms=500
 ```
 
 ### Что выводит load-test
 
-В процессе (run-scoped через `?runId=`):
-
-```text
-produced
-completed
-failed
-pending
-dlxWaiting
-accountedMatchesProduced
-```
-
-Пока доставка идёт, ожидается `produced === completed + pending + failed`.
+В процессе: `produced`, `completed`, `failed`, `pending`, `dlxWaiting`, `accountedMatchesProduced` (ожидается `produced === completed + pending + failed`).
 
 В конце:
 
@@ -581,28 +522,6 @@ throughputPerSecond
 averageDeliveryMs
 ```
 
-Если `DISCORD_WAIT_FOR_MESSAGE=true`, успешный Discord response содержит реальный `discordMessageId`. Его можно проверить в логах:
-
-```powershell
-docker compose logs --since=15m app |
-  Select-String 'discordMessageId:'
-```
-
-### Как доказать успешный retry после `429`
-
-```powershell
-$logs = docker compose logs --since=15m app
-
-'Retry-After:'
-($logs | Select-String 'Discord Retry-After').Count
-
-'Successful Discord responses:'
-($logs | Select-String 'discordMessageId:').Count
-
-'DLX:'
-($logs | Select-String 'discord.webhook.dead_lettered').Count
-```
-
 Для успешного запуска из 25 событий ожидается:
 
 ```text
@@ -613,91 +532,64 @@ pending: 0
 dlxWaiting: 0
 ```
 
+### Как проверить retry после `429`
+
+```bash
+docker compose logs --since=15m app | grep -c "Discord Retry-After"
+docker compose logs --since=15m app | grep -c "discordMessageId"
+docker compose logs --since=15m app | grep -c "discord.webhook.dead_lettered"
+```
+
 Наличие `Discord Retry-After` подтверждает, что Discord реально прислал rate-limit signal, а не только внутренний limiter отложил job.
 
 ## Сценарии отказов
 
-| Сценарий               | Что происходит                      | Ожидаемый результат                     |
-| ---------------------- | ----------------------------------- | --------------------------------------- |
-| `2xx`                  | job завершается                     | `completed + 1`                         |
-| `429`                  | пауза канала + `Retry-After`, delayed retry | eventual success; другие каналы не ждут |
-| `400`                  | permanent failure                   | DLX без retry loop                      |
-| `401/403/404`          | invalid/configuration destination   | DLX                                     |
-| `5xx`                  | exponential retry + jitter          | success или DLX                         |
-| timeout                | retryable error                     | retry с backoff                         |
-| Redis unavailable      | jobs остаются в Redis volume        | recovery после Redis return             |
-| PostgreSQL unavailable | enqueue не подтверждается           | бизнес-событие не теряется молча        |
-| worker crash           | незавершённые jobs recover          | продолжение после restart               |
-| Channel A rate limited | A delayed                           | Channel B продолжает отправку           |
-| duplicate eventId      | outbox `ON CONFLICT DO NOTHING`     | uncontrolled duplicate job не создаётся |
+| Сценарий                    | Что происходит                                              | Ожидаемый результат                                      |
+| --------------------------- | ----------------------------------------------------------- | -------------------------------------------------------- |
+| `2xx`                       | job завершается                                             | `completed + 1`                                          |
+| `429`                       | пауза всего канала на `Retry-After`, расписание сдвигается  | eventual success; другие каналы не ждут                  |
+| `400`                       | некорректный webhook                                        | лог + DLX без retry                                      |
+| `401/403/404`               | retry с backoff                                             | success после исправления или вечный retry (нужен алерт) |
+| `5xx`, timeout, network     | retry с backoff + jitter                                    | eventual success                                         |
+| worker отстал от расписания | send permit выдерживает интервал                            | не больше 2/sec, без всплеска                            |
+| Redis restart               | скрипты перезагружаются автоматически (`NOSCRIPT` → `EVAL`) | доставка продолжается                                    |
+| Redis недоступен            | BullMQ job retry, outbox backoff                            | recovery после возврата Redis                            |
+| PostgreSQL недоступен       | enqueue не подтверждается                                   | бизнес-событие не теряется молча                         |
+| worker crash                | stalled job возвращается в очередь                          | продолжение после restart                                |
+| duplicate `eventId`         | outbox `ON CONFLICT DO NOTHING`, детерминированный job id   | дубль job не создаётся                                   |
 
 ### Проверка DLX
 
-Намеренно неверный webhook URL:
+Намеренно некорректный webhook: Discord отвечает `400`, событие уходит в DLX без повторов.
 
-```powershell
-npm run test:load -- `
-  --count=10 `
-  --channel=dlx-test `
-  --webhook-url=https://discord.com/api/webhooks/invalid/invalid `
+```bash
+npm run test:load -- --count=10 --channel=dlx-test \
+  --webhook-url=https://discord.com/api/webhooks/invalid/invalid \
   --send-summary=false
+
+curl http://localhost:3000/demo/queue-status
 ```
 
-Проверка:
-
-```powershell
-Invoke-RestMethod 'http://localhost:3000/demo/queue-status'
-```
-
-Для invalid destination ожидается увеличение `dlxWaiting`.
+Ожидается увеличение `dlxWaiting` на 10.
 
 ## Перезапуск и восстановление
 
-### Перезапуск app без очистки данных
-
-```powershell
-docker compose restart app
-```
-
-macOS/Linux:
-
 ```bash
+# Перезапуск app без очистки данных
 docker compose restart app
-```
 
-### Полный down/up с сохранением volumes
-
-```powershell
+# Полный down/up с сохранением volumes
 docker compose down
 docker compose up -d
-```
 
-macOS/Linux:
-
-```bash
-docker compose down
-docker compose up -d
-```
-
-Redis AOF и PostgreSQL named volume сохраняют незавершённые jobs/outbox rows.
-
-### Полный сброс локальной среды
-
-```powershell
+# Полный сброс локальной среды (удаляет Redis и PostgreSQL volumes)
 docker compose down -v
 docker compose up -d --build
 ```
 
-macOS/Linux:
+Redis AOF и PostgreSQL named volume сохраняют незавершённые jobs и outbox rows.
 
-```bash
-docker compose down -v
-docker compose up -d --build
-```
-
-`down -v` удаляет Redis и PostgreSQL volumes, поэтому использовать его следует только для чистого теста.
-
-## Подключение к PostgreSQL с Windows
+## Подключение к PostgreSQL
 
 В pgAdmin, DBeaver или другом клиенте:
 
@@ -718,113 +610,48 @@ FROM webhook_outbox_events
 ORDER BY created_at DESC;
 ```
 
-### Подключение с macOS/Linux
-
-Параметры подключения те же, потому что Docker публикует PostgreSQL на host-порт `5444`:
-
-```text
-Host: localhost
-Port: 5444
-Database: discord_limits
-User: discord_app
-Password: discord_app_password
-SSL: Disable
-```
-
-Проверить доступность через `psql`:
-
-```bash
-PGPASSWORD=discord_app_password psql \
-  -h localhost \
-  -p 5444 \
-  -U discord_app \
-  -d discord_limits \
-  -c "SELECT event_id, status, attempts FROM webhook_outbox_events ORDER BY created_at DESC;"
-```
-
 ## Конфигурация
 
-| Variable                              | Назначение                               | Default                        |
-| ------------------------------------- | ---------------------------------------- | ------------------------------ |
-| `PORT`                                | HTTP port                                | `3000`                         |
-| `REDIS_HOST`                          | Redis host                               | `localhost`                    |
-| `REDIS_PORT`                          | Redis port                               | `6379`                         |
-| `POSTGRES_HOST`                       | PostgreSQL host                          | `localhost`                    |
-| `POSTGRES_PORT`                       | PostgreSQL port                          | `5432` внутри Docker           |
-| `POSTGRES_DB`                         | Database                                 | `discord_limits`               |
-| `POSTGRES_USER`                       | User                                     | `discord_app`                  |
-| `POSTGRES_PASSWORD`                   | Password                                 | `discord_app_password`         |
-| `POSTGRES_POOL_SIZE`                  | PG pool size                             | `10`                           |
-| `OUTBOX_POLL_INTERVAL_MS`             | Publisher polling interval               | `1000`                         |
-| `OUTBOX_BATCH_SIZE`                   | Outbox batch size                        | `100`                          |
-| `OUTBOX_LEASE_MS`                     | Lease timeout                            | `30000`                        |
-| `DISCORD_RATE_LIMIT_PER_SECOND`       | Safety limit per channel                 | `2`                            |
-| `DISCORD_RATE_LIMIT_CLEANUP_GRACE_MS` | Limiter TTL grace после последнего слота | `1000`                         |
-| `DISCORD_WORKER_CONCURRENCY`          | Worker concurrency                       | `10`                           |
-| `DISCORD_REQUEST_TIMEOUT_MS`          | HTTP timeout                             | `10000`                        |
-| `DISCORD_WAIT_FOR_MESSAGE`            | Ask Discord for message body/id          | `true`                         |
-| `DISCORD_RETRY_MAX_ATTEMPTS`          | Retry limit                              | `5`                            |
-| `DISCORD_RETRY_BASE_DELAY_MS`         | Retry base delay                         | `1000`                         |
-| `DISCORD_RETRY_MAX_DELAY_MS`          | Retry max delay                          | `30000`                        |
-| `DISCORD_WEBHOOK_A`                   | Demo webhook A                           | required for demo              |
-| `DISCORD_WEBHOOK_B`                   | Demo webhook B                           | required for both-channel demo |
+| Variable                              | Назначение                                                               | Default                        |
+| ------------------------------------- | ------------------------------------------------------------------------ | ------------------------------ |
+| `PORT`                                | HTTP port                                                                | `3000`                         |
+| `REDIS_HOST`                          | Redis host                                                               | `localhost`                    |
+| `REDIS_PORT`                          | Redis port (внутри Docker)                                               | `6379`                         |
+| `REDIS_HOST_PORT`                     | Порт Redis на хосте (Compose, интеграционные тесты)                      | `6380`                         |
+| `POSTGRES_HOST`                       | PostgreSQL host                                                          | `localhost`                    |
+| `POSTGRES_PORT`                       | PostgreSQL port                                                          | `5432` внутри Docker           |
+| `POSTGRES_DB`                         | Database                                                                 | `discord_limits`               |
+| `POSTGRES_USER`                       | User                                                                     | `discord_app`                  |
+| `POSTGRES_PASSWORD`                   | Password                                                                 | `discord_app_password`         |
+| `POSTGRES_POOL_SIZE`                  | PG pool size                                                             | `10`                           |
+| `OUTBOX_POLL_INTERVAL_MS`             | Polling-страховка publisher                                              | `1000`                         |
+| `OUTBOX_BATCH_SIZE`                   | Outbox batch size                                                        | `100`                          |
+| `OUTBOX_LEASE_MS`                     | Lease timeout                                                            | `30000`                        |
+| `DISCORD_RATE_LIMIT_PER_SECOND`       | Лимит отправок на канал                                                  | `2`                            |
+| `DISCORD_RATE_LIMIT_CLEANUP_GRACE_MS` | TTL grace ключа канала после последнего слота                            | `1000`                         |
+| `DISCORD_WORKER_CONCURRENCY`          | Worker concurrency                                                       | `10`                           |
+| `DISCORD_REQUEST_TIMEOUT_MS`          | HTTP timeout                                                             | `10000`                        |
+| `DISCORD_WAIT_FOR_MESSAGE`            | Запрашивать у Discord тело сообщения (`message.id`)                      | `true`                         |
+| `DISCORD_RETRY_MAX_ATTEMPTS`          | Лимит попыток для не-`400` ошибок (`0` — без лимита; `429` не считается) | `0`                            |
+| `DISCORD_RETRY_BASE_DELAY_MS`         | Базовая задержка retry                                                   | `1000`                         |
+| `DISCORD_RETRY_MAX_DELAY_MS`          | Максимальная задержка retry                                              | `300000`                       |
+| `DISCORD_WEBHOOK_A`                   | Demo webhook A                                                           | required for demo              |
+| `DISCORD_WEBHOOK_B`                   | Demo webhook B                                                           | required for both-channel demo |
 
 `.env` не коммитится. Webhook URL нельзя публиковать или выводить в логи.
 
 ## Тесты проекта
 
-Полная проверка — это не одна команда. Слои разделены специально:
+| Команда                          | Что проверяет                                                         | Нужен стек               |
+| -------------------------------- | --------------------------------------------------------------------- | ------------------------ |
+| `npm test`                       | Unit: processor (400/429/retry/backoff), classifier, limiter, enqueue | нет                      |
+| `npm run test:e2e`               | HTTP demo API: валидация входа                                        | нет                      |
+| `npm run test:redis-integration` | Lua limiter на реальном Redis                                         | Redis                    |
+| `npm run test:load`              | Outbox → BullMQ → rate limit → Discord / DLX                          | Docker Compose + webhook |
 
-| Команда | Что проверяет | Нужен стек |
-| ------- | ------------- | ---------- |
-| `npm test` / `npm run test:cov` | Unit: classifier, enqueue, mock Redis limiter, Hello World | нет |
-| `npm run test:redis-integration` | Lua limiter на реальном Redis | Redis |
-| `npm run test:e2e` | HTTP `GET /` | нет |
-| `npm run test:load` | Outbox → BullMQ → rate limit → Discord / DLX | Docker Compose + webhook |
+`npm test` пропускает Redis integration suite: она включается только через `npm run test:redis-integration`.
 
-`npm test` и `npm run test:cov` **пропускают** Redis integration (`4 skipped`): suite включается только при `RUN_REDIS_INTEGRATION=1`, который выставляет `test:redis-integration`. Низкий процент в `test:cov` (~20%) ожидаем: unit-тесты не гоняют `WebhookProcessor`, outbox publisher, transport, demo/health. Эти пути закрываются redis-integration и load-test.
-
-Установить зависимости:
-
-```powershell
-npm ci
-```
-
-Lint:
-
-```powershell
-npm run lint
-npm run lint:fix
-```
-
-Format:
-
-```powershell
-npm run format
-npm run format:check
-```
-
-Build:
-
-```powershell
-npm run build
-```
-
-Unit tests:
-
-```powershell
-npm test
-npm test -- --runInBand
-npm run test:cov
-```
-
-E2E:
-
-```powershell
-npm run test:e2e
-```
-
-Интеграционная проверка Lua limiter на реальном Redis:
+Интеграционная проверка limiter на реальном Redis (по умолчанию `localhost:6380`, можно переопределить через `REDIS_TEST_HOST` / `REDIS_TEST_PORT`):
 
 ```bash
 docker compose up -d redis
@@ -833,29 +660,37 @@ npm run test:redis-integration
 
 Она проверяет:
 
-- позднее событие после уже зарезервированной пачки встаёт в конец расписания (TTL хвоста);
-- независимость ключей разных каналов;
-- автоматическое истечение limiter key после последнего слота + grace;
-- после Discord `429` / `pauseChannel` dispatch блокируется для всего канала, другой канал продолжает работу.
+- позднее событие после уже зарезервированной пачки встаёт в конец расписания;
+- независимость разных каналов;
+- автоматическое истечение ключа канала после последнего слота + grace;
+- опоздавшие jobs не уходят чаще интервала;
+- после `429` канал на паузе целиком, расписание сдвинуто без дыр, другой канал работает;
+- limiter продолжает работать после потери кэша Lua-скриптов (рестарт Redis).
 
-Нагрузочная проверка на живом стеке (см. [Нагрузочное тестирование](#нагрузочное-тестирование)):
+Остальные проверки:
 
-```powershell
-docker compose up -d --build
-npm run test:load -- --count=10 --channel=load-test-channel --send-summary=false
-```
-
-Compose validation:
-
-```powershell
+```bash
+npm ci
+npm run lint
+npm run format:check
+npx tsc --noEmit
+npm run build
 docker compose config
 ```
+
+## Безопасность
+
+- `.env` и webhook URL не коммитятся и не пишутся в логи;
+- Demo API принимает только Discord webhook URLs, поэтому сервис нельзя использовать для запросов на произвольные хосты;
+- webhook URL — это секрет: он хранится в outbox-событии и в DLX envelope, поэтому доступ к PostgreSQL и Redis нужно ограничивать так же, как к секретам;
+- credentials из `docker-compose.yml` и README предназначены только для локальной разработки;
+- в production webhook URL лучше хранить в secret manager и передавать в событии только идентификатор destination.
 
 ## Trade-offs
 
 ### Redis + BullMQ вместо Kafka
 
-Меньше инфраструктуры и естественная поддержка delayed jobs. Kafka была бы оправдана event streaming требованиями, которых у этого модуля нет.
+Меньше инфраструктуры и естественная поддержка delayed jobs. Kafka была бы оправдана event-streaming требованиями, которых у этого модуля нет.
 
 ### Custom limiter вместо BullMQ Pro
 
@@ -867,41 +702,25 @@ docker compose config
 
 ### At-least-once вместо exactly-once
 
-Это честная семантика для внешнего HTTP API. Event ID помогает deduplicate enqueue, но не может отменить неопределённость network timeout.
+Это честная семантика для внешнего HTTP API. Event ID и детерминированные job id убирают дубли внутри системы, но не могут отменить неопределённость network timeout.
 
 ### Configured safety ceiling
 
-Даже если Discord возвращает более высокий bucket limit, локальный safety limit из задания остаётся ограничителем. Это сознательный приоритет correctness над максимальным throughput.
+Даже если Discord возвращает более высокий bucket limit, локальный лимит остаётся ограничителем. Это сознательный приоритет отсутствия `429` над максимальным throughput.
+
+### Повторы без лимита
+
+Только `400` однозначно означает «событие никогда не будет доставлено». Остальные ошибки могут быть временными (`5xx`, сеть) или исправимыми (`401/403/404` — webhook пересоздан или восстановлен), поэтому событие не выбрасывается. Обратная сторона: если webhook удалён навсегда, события этого канала будут повторяться с максимальной задержкой (`DISCORD_RETRY_MAX_DELAY_MS`). В production такой сценарий закрывается алертом; при необходимости можно включить `DISCORD_RETRY_MAX_ATTEMPTS`.
 
 ## Production considerations
 
 В production дополнительно стоит рассмотреть:
 
-- настоящий migration tool вместо init SQL;
+- INSERT в outbox в той же транзакции, что и бизнес-изменения (передавать транзакционный client в `OutboxRepository`);
+- настоящий migration tool вместо `CREATE TABLE IF NOT EXISTS` при старте;
 - secret manager и encryption webhook URLs;
-- transactional outbox в той же бизнес-транзакции, что и domain changes;
 - OpenTelemetry и distributed tracing;
-- Prometheus metrics и alerting;
-- отдельную политику хранения completed jobs;
-- webhook health management и automatic disable после permanent errors;
-- managed Redis/PostgreSQL и backups;
-- несколько publisher replicas с lease coordination;
+- Prometheus metrics и alerting: длительная пауза канала, долгие retry `401/403/404`, рост DLX;
+- redrive из DLX после исправления payload;
 - cleanup policy для published outbox rows;
-- idempotency support на стороне downstream API.
-
-## Git history
-
-История проекта разбита на небольшие Conventional Commits:
-
-```text
-chore: initialize NestJS project
-feat: add BullMQ webhook delivery pipeline
-feat: add demo API and Docker environment
-test: cover webhook delivery scenarios
-refactor: polish project structure and module aliases
-test: add webhook load testing scenario
-fix: preserve rate limit reservations across retries
-fix: normalize BullMQ job identifiers
-feat: persist Redis queue data across restarts
-feat: add PostgreSQL transactional outbox
-```
+- managed Redis/PostgreSQL и backups.
