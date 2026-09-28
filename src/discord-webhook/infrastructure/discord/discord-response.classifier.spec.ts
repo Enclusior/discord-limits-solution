@@ -10,6 +10,30 @@ describe('DiscordResponseClassifier', () => {
     });
   });
 
+  it('reports an exhausted Discord bucket on a successful response', () => {
+    expect(
+      classifier.classify({
+        statusCode: 200,
+        headers: {
+          'x-ratelimit-remaining': '0',
+          'x-ratelimit-reset-after': '1.5',
+        },
+      }),
+    ).toEqual({ type: 'success', statusCode: 200, rateLimitResetMs: 1500 });
+  });
+
+  it('does not pause while the Discord bucket still has requests left', () => {
+    expect(
+      classifier.classify({
+        statusCode: 200,
+        headers: {
+          'x-ratelimit-remaining': '1',
+          'x-ratelimit-reset-after': '1.5',
+        },
+      }),
+    ).toEqual({ type: 'success', statusCode: 200 });
+  });
+
   it('prefers body retry_after (seconds) for 429', () => {
     expect(
       classifier.classify({

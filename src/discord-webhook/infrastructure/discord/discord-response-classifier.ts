@@ -15,7 +15,10 @@ export class DiscordResponseClassifier {
     const { statusCode } = response;
 
     if (statusCode >= 200 && statusCode < 300) {
-      return { type: 'success', statusCode };
+      const rateLimitResetMs = this.readExhaustedBucketResetMs(response);
+      return rateLimitResetMs === undefined
+        ? { type: 'success', statusCode }
+        : { type: 'success', statusCode, rateLimitResetMs };
     }
 
     if (statusCode === 429) {
@@ -40,6 +43,22 @@ export class DiscordResponseClassifier {
       statusCode,
       reason: `Discord returned HTTP ${statusCode}`,
     };
+  }
+
+  /**
+   * Если в ответе X-RateLimit-Remaining: 0, следующий запрос до сброса лимита
+   * гарантированно получит 429. Возвращает время до сброса (X-RateLimit-Reset-After, секунды).
+   */
+  private readExhaustedBucketResetMs(
+    response: DiscordHttpResponse,
+  ): number | undefined {
+    if (response.headers['x-ratelimit-remaining'] !== '0') {
+      return undefined;
+    }
+    const seconds = Number(response.headers['x-ratelimit-reset-after']);
+    return Number.isFinite(seconds) && seconds > 0
+      ? Math.ceil(seconds * 1000)
+      : undefined;
   }
 
   /** Discord отдаёт retry_after (тело) и Retry-After (заголовок) в секундах. */

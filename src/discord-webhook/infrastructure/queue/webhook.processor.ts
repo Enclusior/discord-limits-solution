@@ -90,6 +90,9 @@ export class WebhookProcessor implements OnModuleInit, OnModuleDestroy {
     const result = this.classifier.classify(response);
     switch (result.type) {
       case 'success':
+        if (result.rateLimitResetMs !== undefined) {
+          await this.pauseExhaustedChannel(job, result.rateLimitResetMs);
+        }
         return this.markDelivered(job, result.statusCode, response.body);
       case 'rate_limited':
         await this.limiter.pauseChannel(data.channelId, result.retryAfterMs);
@@ -116,6 +119,33 @@ export class WebhookProcessor implements OnModuleInit, OnModuleDestroy {
       case 'retryable_failure':
         await this.retry(job, result.reason, result.statusCode);
         return undefined;
+    }
+  }
+
+  /**
+   * Discord сообщил, что лимит канала исчерпан: ставим канал на паузу до сброса
+   * заранее, не дожидаясь 429. Сообщение уже доставлено, поэтому ошибка Redis
+   * здесь не должна приводить к повтору задачи (и дублю в Discord).
+   */
+  private async pauseExhaustedChannel(
+    job: Job<DiscordWebhookJob>,
+    resetAfterMs: number,
+  ): Promise<void> {
+    try {
+      await this.limiter.pauseChannel(job.data.channelId, resetAfterMs);
+      this.logger.warn({
+        event: 'discord.webhook.bucket_exhausted',
+        eventId: job.data.eventId,
+        channelId: job.data.channelId,
+        jobId: job.id,
+        resetAfterMs,
+      });
+    } catch (error) {
+      this.logger.error({
+        event: 'discord.webhook.pause_failed',
+        channelId: job.data.channelId,
+        reason: error instanceof Error ? error.message : 'unknown error',
+      });
     }
   }
 

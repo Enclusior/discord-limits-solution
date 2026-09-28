@@ -93,6 +93,41 @@ describe('WebhookProcessor', () => {
     expect(queue.add).not.toHaveBeenCalled();
   });
 
+  it('pauses the channel in advance when Discord reports an exhausted bucket', async () => {
+    const { processor, limiter, queue } = createProcessor({
+      response: {
+        statusCode: 200,
+        headers: {
+          'x-ratelimit-remaining': '0',
+          'x-ratelimit-reset-after': '1.5',
+        },
+      },
+    });
+
+    await expect(processor.handle(createJob())).resolves.toMatchObject({
+      statusCode: 200,
+    });
+    expect(limiter.pauseChannel).toHaveBeenCalledWith('channel-a', 1500);
+    expect(queue.add).not.toHaveBeenCalled();
+  });
+
+  it('still completes a delivered job when the advance pause fails', async () => {
+    const { processor, limiter } = createProcessor({
+      response: {
+        statusCode: 200,
+        headers: {
+          'x-ratelimit-remaining': '0',
+          'x-ratelimit-reset-after': '1.5',
+        },
+      },
+    });
+    limiter.pauseChannel.mockRejectedValue(new Error('Connection is closed.'));
+
+    await expect(processor.handle(createJob())).resolves.toMatchObject({
+      statusCode: 200,
+    });
+  });
+
   it('reuses an existing reservation instead of taking a new slot', async () => {
     const { processor, limiter } = createProcessor();
 
