@@ -61,21 +61,35 @@ const enqueueDurationMs = Date.now() - startedAt;
 let lastStatus;
 for (;;) {
   lastStatus = await request(`/demo/queue-status?runId=${runId}`);
-  const pending = lastStatus.waiting + lastStatus.active + lastStatus.delayed;
+  const {
+    produced = 0,
+    completed = 0,
+    failed = 0,
+    pending = 0,
+    dlxWaiting = 0,
+    averageDeliveryMs = null,
+  } = lastStatus;
+  const accounted = completed + pending + failed;
   const elapsedMs = Date.now() - startedAt;
 
   console.log(
     JSON.stringify({
       event: 'load_test.progress',
       elapsedMs,
+      produced,
+      completed,
+      failed,
       pending,
-      ...lastStatus,
+      dlxWaiting,
+      averageDeliveryMs,
+      accountedMatchesProduced: accounted === produced,
     }),
   );
 
   if (
+    produced >= producedCount &&
     pending === 0 &&
-    lastStatus.completed + lastStatus.failed >= producedCount
+    completed + failed >= producedCount
   ) {
     break;
   }
