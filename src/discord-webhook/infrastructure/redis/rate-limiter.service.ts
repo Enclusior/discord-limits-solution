@@ -21,7 +21,7 @@ const defineScript = (source: string): LuaScript => ({
 
 // Состояние канала хранится в одном hash:
 //   next    - время следующего свободного слота расписания;
-//   blocked - до какого момента канал на паузе после Discord 429;
+//   blocked - до какого момента канал на паузе (429 или исчерпанный лимит Discord);
 //   shift   - суммарный сдвиг расписания из-за пауз (двигает уже выданные слоты);
 //   last    - время последней фактической отправки в канал.
 const REDIS_NOW_MS = `
@@ -47,14 +47,23 @@ local reserved_slot = tonumber(ARGV[1])
 local reserved_shift = tonumber(ARGV[2])
 local interval_ms = tonumber(ARGV[3])
 local grace_ms = tonumber(ARGV[4])
-local state = redis.call('HMGET', KEYS[1], 'blocked', 'shift', 'last')
-local blocked = tonumber(state[1] or '0')
-local shift = tonumber(state[2] or '0')
-local last = tonumber(state[3] or '0')
+local state = redis.call('HMGET', KEYS[1], 'next', 'blocked', 'shift', 'last')
+local next_slot = tonumber(state[1] or '0')
+local blocked = tonumber(state[2] or '0')
+local shift = tonumber(state[3] or '0')
+local last = tonumber(state[4] or '0')
 local slot = reserved_slot + math.max(0, shift - reserved_shift)
 local ready_at = math.max(slot, blocked, last + interval_ms)
 if ready_at > now then
-  return { 0, ready_at - now, slot, shift }
+  -- Слот давно прошёл (например, воркеры простаивали): не ждём вместе
+  -- с другими опоздавшими задачами, а берём новый слот в конце расписания.
+  -- Иначе N опоздавших задач просыпались бы разом N раз подряд.
+  if slot + interval_ms < now then
+    slot = math.max(next_slot, ready_at)
+    redis.call('HSET', KEYS[1], 'next', slot + interval_ms)
+    redis.call('PEXPIRE', KEYS[1], slot + interval_ms - now + grace_ms)
+  end
+  return { 0, math.max(slot, ready_at) - now, slot, shift }
 end
 redis.call('HSET', KEYS[1], 'last', now)
 if redis.call('PTTL', KEYS[1]) < interval_ms + grace_ms then
@@ -99,7 +108,8 @@ export class RateLimiterService {
   /**
    * Атомарно разрешает отправку, только если наступил слот события
    * (с учётом сдвига после пауз), канал не на паузе и с прошлой отправки
-   * прошёл интервал. Иначе возвращает точную задержку до следующей проверки.
+   * прошёл интервал. Иначе возвращает точную задержку до следующей проверки;
+   * задаче, чей слот давно прошёл, сразу выдаётся новый слот в конце расписания.
    */
   async acquireSendPermit(
     channelId: string,

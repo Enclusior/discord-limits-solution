@@ -105,6 +105,41 @@ describeRedisIntegration('RateLimiterService Redis integration', () => {
     }
   });
 
+  it('spreads a backlog of long-overdue events instead of waking them all at once', async () => {
+    const channelId = channel('backlog');
+    // Пять задач, чьи слоты прошли 10 секунд назад (например, после простоя).
+    const overdue = { slotAt: (await redisNow()) - 10000, shift: 0 };
+
+    await expect(
+      limiter.acquireSendPermit(channelId, overdue),
+    ).resolves.toEqual({ status: 'granted' });
+
+    const slots: number[] = [];
+    for (let index = 0; index < 4; index += 1) {
+      const permit = await limiter.acquireSendPermit(channelId, overdue);
+      expect(permit.status).toBe('wait');
+      if (permit.status === 'wait') slots.push(permit.reservation.slotAt);
+    }
+
+    // Каждая получила свой слот в конце расписания с шагом 500 мс.
+    expect(slots.slice(1).map((slot, index) => slot - slots[index])).toEqual([
+      500, 500, 500,
+    ]);
+  });
+
+  it('keeps the slot of an on-time event that only waits for the interval', async () => {
+    const channelId = channel('on-time');
+    const now = await redisNow();
+
+    await expect(
+      limiter.acquireSendPermit(channelId, { slotAt: now - 100, shift: 0 }),
+    ).resolves.toEqual({ status: 'granted' });
+
+    const onTime = { slotAt: now, shift: 0 };
+    const permit = await limiter.acquireSendPermit(channelId, onTime);
+    expect(permit).toMatchObject({ status: 'wait', reservation: onTime });
+  });
+
   it('pauses the whole channel on 429 and shifts its schedule without gaps', async () => {
     const channelA = channel('429-a');
     const channelB = channel('429-b');
